@@ -22,6 +22,10 @@ Go 1.22 or newer. Standard library only.
 - `(*Roller).Range(from, to time.Time) []Window` returns the buckets overlapping `[from, to)` in time order.
 - `(*Roller).Cursor(from, to time.Time) *Cursor` snapshots a range for batched reads; `(*Cursor).Next(n int) []Window` returns the next batch, then an empty slice once the range is exhausted.
 - `(*Roller).Merge(other *Roller) error` folds another roller into this one.
+- `(*Roller).Rollup(factor int) *View` derives a read-only view whose windows are `factor` times wider, merged from the roller's own windows; it panics with `rollup: bad factor` if `factor <= 0`.
+- `(*View).Window(start time.Time) Window` returns the coarse window starting at `start`, or a zero `Window` (count 0) if none does.
+- `(*View).Range(from, to time.Time) []Window` returns the coarse windows overlapping `[from, to)` in time order.
+- `(*View).Cursor(from, to time.Time) *Cursor` snapshots a coarse range for batched reads.
 - `type Window struct { Start time.Time; Count int64; Sum, Min, Max float64 }`.
 - `rollup.ErrOutOfOrder`, `rollup.ErrWindowMismatch` error values.
 

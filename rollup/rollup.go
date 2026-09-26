@@ -86,13 +86,18 @@ func New(window time.Duration) *Roller {
 }
 
 // startOf returns the start of the window containing at, aligned to an
-// integer multiple of the window size since the Unix epoch. The arithmetic
-// is exact for any time value, including ones whose nanosecond offset from
-// the epoch does not fit in an int64.
+// integer multiple of the window size since the Unix epoch.
 func (r *Roller) startOf(at time.Time) time.Time {
+	return alignStart(at, r.window.Nanoseconds())
+}
+
+// alignStart returns the start of the window of width w nanoseconds
+// containing at, aligned to an integer multiple of w since the Unix epoch.
+// The arithmetic is exact for any time value, including ones whose
+// nanosecond offset from the epoch does not fit in an int64.
+func alignStart(at time.Time, w int64) time.Time {
 	sec := at.Unix()
 	nsec := int64(at.Nanosecond())
-	w := r.window.Nanoseconds()
 	if sec >= -9223372036 && sec <= 9223372035 {
 		// sec*1e9+nsec fits in an int64. Rounding a negative ns down to
 		// a window multiple can reach ns-(w-1), so stay on the fast
@@ -108,7 +113,7 @@ func (r *Roller) startOf(at time.Time) time.Time {
 	return windowStartWide(sec, nsec, w)
 }
 
-// windowStartWide is the 128-bit slow path of startOf, for times whose
+// windowStartWide is the 128-bit slow path of alignStart, for times whose
 // nanosecond offset from the epoch overflows an int64.
 func windowStartWide(sec, nsec, w int64) time.Time {
 	// t = sec*1e9 + nsec as a 128-bit two's-complement value (hi, lo).
