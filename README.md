@@ -15,6 +15,8 @@ Go 1.22 or newer. Standard library only.
 
 `rollup.New(window time.Duration) *Roller` builds a roller.
 - `(*Roller).Add(at time.Time, value float64) error` files a sample into its window.
+- `(*Roller).AddBatch(samples []Sample) error` files a batch of samples atomically: all of them or none.
+- `type Sample struct { At time.Time; Value float64 }`.
 - `(*Roller).Window(start time.Time) (Window, bool)` returns a single bucket.
 - `(*Roller).Windows() []Window` returns buckets in time order.
 - `(*Roller).Range(from, to time.Time) []Window` returns the buckets overlapping `[from, to)` in time order.

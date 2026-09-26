@@ -3,8 +3,8 @@
 //
 // A Roller is safe for concurrent use: samples may be filed, windows read,
 // and rollers merged from multiple goroutines at once. Every read observes
-// an internally consistent snapshot, and a merge is visible to other
-// callers either in full or not at all.
+// an internally consistent snapshot, and a merge or batch is visible to
+// other callers either in full or not at all.
 package rollup
 
 import (
@@ -23,6 +23,13 @@ var ErrOutOfOrder = errors.New("rollup: out of order")
 // ErrWindowMismatch is returned by Merge when the two rollers use different
 // window sizes.
 var ErrWindowMismatch = errors.New("rollup: window mismatch")
+
+// Sample is one record in a batch passed to AddBatch: a value observed at
+// one instant.
+type Sample struct {
+	At    time.Time
+	Value float64
+}
 
 // Window holds the aggregate statistics of the samples filed into one
 // window. Start is the window's left-closed, right-open lower bound.
@@ -226,6 +233,60 @@ func (r *Roller) Add(at time.Time, value float64) error {
 	if r.hasAny && at.Before(r.latest) {
 		return ErrOutOfOrder
 	}
+	r.fileLocked(at, value)
+	r.latest = at
+	r.hasAny = true
+	return nil
+}
+
+// AddBatch files a batch of samples as one atomic unit: either every
+// sample takes effect or none does. The samples may arrive in any order
+// and are not checked against each other; several samples at the same
+// instant are each counted. Each sample is filed into its epoch-aligned
+// window exactly as Add would file it.
+//
+// If any sample predates the most recent sample the roller has already
+// accepted, the whole batch is rejected with ErrOutOfOrder and the roller
+// is left unchanged. Otherwise the most-recent marker advances to the
+// later of its previous value and the newest sample in the batch. A nil
+// or empty batch is accepted, changes nothing, and does not advance the
+// marker.
+//
+// The batch is atomic with respect to every other call on the roller:
+// concurrent adds, batches, merges, range reads, and cursor creation
+// observe the roller wholly before or wholly after the batch.
+func (r *Roller) AddBatch(samples []Sample) error {
+	if len(samples) == 0 {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// One pass to validate the batch against the accepted marker and find
+	// its newest instant; nothing is filed until every sample is known to
+	// be acceptable, so a rejection leaves the roller untouched.
+	latest := samples[0].At
+	for _, s := range samples {
+		if r.hasAny && s.At.Before(r.latest) {
+			return ErrOutOfOrder
+		}
+		if s.At.After(latest) {
+			latest = s.At
+		}
+	}
+	for _, s := range samples {
+		r.fileLocked(s.At, s.Value)
+	}
+	if r.hasAny && r.latest.After(latest) {
+		latest = r.latest
+	}
+	r.latest = latest
+	r.hasAny = true
+	return nil
+}
+
+// fileLocked folds one sample into its window. The caller must hold mu
+// and must already have cleared the out-of-order check.
+func (r *Roller) fileLocked(at time.Time, value float64) {
 	start := r.startOf(at)
 	n := len(r.buckets)
 	switch {
@@ -257,9 +318,6 @@ func (r *Roller) Add(at time.Time, value float64) error {
 			r.maybeFlushBack()
 		}
 	}
-	r.latest = at
-	r.hasAny = true
-	return nil
 }
 
 // newBucket returns a window holding a single sample.
