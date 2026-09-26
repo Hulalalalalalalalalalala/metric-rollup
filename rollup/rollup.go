@@ -1,10 +1,17 @@
 // Package rollup downsamples a time series into fixed windows aligned to
 // the Unix epoch, and merges rollups that share a window size.
+//
+// A Roller is safe for concurrent use: samples may be filed, windows read,
+// and rollers merged from multiple goroutines at once. Every read observes
+// an internally consistent snapshot, and a merge is visible to other
+// callers either in full or not at all.
 package rollup
 
 import (
 	"errors"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,12 +34,23 @@ type Window struct {
 }
 
 // Roller aggregates samples into fixed windows of a single size.
+//
+// The zero value is not usable; build one with New. All methods are safe
+// to call concurrently from multiple goroutines.
 type Roller struct {
+	// mu guards buckets, latest, and hasAny. window and id are fixed at
+	// construction and read without the lock.
+	mu      sync.RWMutex
+	id      uint64
 	window  time.Duration
 	buckets map[int64]*Window
 	latest  time.Time
 	hasAny  bool
 }
+
+// idGen hands out unique roller IDs so Merge can lock two rollers in a
+// consistent order and concurrent cross-merges cannot deadlock.
+var idGen atomic.Uint64
 
 // New builds a roller with the given window size. It panics with
 // "rollup: bad window" if window is not positive.
@@ -41,6 +59,7 @@ func New(window time.Duration) *Roller {
 		panic("rollup: bad window")
 	}
 	return &Roller{
+		id:      idGen.Add(1),
 		window:  window,
 		buckets: make(map[int64]*Window),
 	}
@@ -61,7 +80,13 @@ func (r *Roller) startOf(at time.Time) int64 {
 // Add files a sample into its window. A sample earlier than the most recent
 // accepted sample is rejected with ErrOutOfOrder and leaves the roller
 // unchanged; a sample at the same instant is accepted and counted again.
+//
+// Concurrent Adds are serialized: each takes effect in the order it
+// acquires the roller, and the out-of-order check is measured against the
+// samples accepted before it in that order.
 func (r *Roller) Add(at time.Time, value float64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.hasAny && at.Before(r.latest) {
 		return ErrOutOfOrder
 	}
@@ -90,8 +115,11 @@ func (r *Roller) Add(at time.Time, value float64) error {
 
 // Window returns the bucket whose start matches start exactly. The second
 // result is false when no bucket starts at that instant; no nearby bucket
-// is substituted.
+// is substituted. The returned Window is a copy and stays valid no matter
+// what is filed afterwards.
 func (r *Roller) Window(start time.Time) (Window, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	w, ok := r.buckets[start.UnixNano()]
 	if !ok {
 		return Window{}, false
@@ -100,8 +128,11 @@ func (r *Roller) Window(start time.Time) (Window, bool) {
 }
 
 // Windows returns all buckets in time order. An empty roller yields an
-// empty slice.
+// empty slice. The result is a snapshot of one moment: samples filed after
+// the call do not alter it.
 func (r *Roller) Windows() []Window {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	starts := make([]int64, 0, len(r.buckets))
 	for start := range r.buckets {
 		starts = append(starts, start)
@@ -120,12 +151,34 @@ func (r *Roller) Windows() []Window {
 // tracking. It panics with "rollup: nil roller" if other is nil, and
 // returns ErrWindowMismatch, leaving this roller unchanged, if the window
 // sizes differ.
+//
+// The merge is atomic with respect to every other call on either roller:
+// concurrent readers see this roller wholly before or wholly after the
+// merge, and a sample filed into other while the merge runs is either
+// folded in completely or not at all. If the two rollers merge each other
+// at the same time, the outcome matches some serial order of the two
+// merges; neither is lost.
 func (r *Roller) Merge(other *Roller) error {
 	if other == nil {
 		panic("rollup: nil roller")
 	}
 	if other.window != r.window {
 		return ErrWindowMismatch
+	}
+	if r == other {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+	} else {
+		// Lock both rollers in ID order so simultaneous merges in
+		// opposite directions cannot deadlock.
+		first, second := r, other
+		if other.id < r.id {
+			first, second = other, r
+		}
+		first.mu.Lock()
+		second.mu.Lock()
+		defer second.mu.Unlock()
+		defer first.mu.Unlock()
 	}
 	for start, ow := range other.buckets {
 		w, ok := r.buckets[start]
