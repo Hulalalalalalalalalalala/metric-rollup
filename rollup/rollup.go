@@ -11,6 +11,7 @@ import (
 	"errors"
 	"math"
 	"math/bits"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -265,6 +266,74 @@ func (r *Roller) Add(at time.Time, value float64) error {
 // newBucket returns a window holding a single sample.
 func newBucket(start time.Time, value float64) Window {
 	return Window{Start: start, Count: 1, Sum: value, Min: value, Max: value}
+}
+
+// Sample is one record in a batch submitted to AddBatch: a value observed
+// at one instant.
+type Sample struct {
+	At    time.Time
+	Value float64
+}
+
+// AddBatch files a batch of samples into their windows as one atomic
+// unit: either every sample in the batch takes effect or none does.
+// Samples within the batch may arrive in any order and may repeat an
+// instant; each is counted on its own and filed into its epoch-aligned
+// window exactly as Add would file it.
+//
+// If any sample predates the most recent sample the roller has already
+// accepted, the whole batch is rejected with ErrOutOfOrder and the roller
+// is left unchanged; samples within the batch are not checked against
+// each other. On success the most-recent-sample mark advances to the
+// later of its previous value and the newest instant in the batch. A nil
+// or empty batch is accepted, changes nothing, and does not advance the
+// mark.
+//
+// The batch is atomic with respect to every other call: concurrent
+// readers see the roller wholly before or wholly after it, and a
+// concurrent merge, range query, or cursor observes a consistent
+// snapshot either way.
+func (r *Roller) AddBatch(samples []Sample) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(samples) == 0 {
+		return nil
+	}
+	// Validate the whole batch before touching any state, so a rejection
+	// leaves the roller exactly as it was.
+	newest := samples[0].At
+	for _, s := range samples {
+		if r.hasAny && s.At.Before(r.latest) {
+			return ErrOutOfOrder
+		}
+		if newest.Before(s.At) {
+			newest = s.At
+		}
+	}
+	// Fold the batch into one bucket per window first, so the cost stays
+	// linear in the number of samples no matter how they are ordered.
+	// startOf always returns UTC times, so equal starts map to equal keys.
+	index := make(map[time.Time]int)
+	var wins []Window
+	for _, s := range samples {
+		start := r.startOf(s.At)
+		if i, ok := index[start]; ok {
+			addTo(&wins[i], s.Value)
+		} else {
+			index[start] = len(wins)
+			wins = append(wins, newBucket(start, s.Value))
+		}
+	}
+	slices.SortFunc(wins, func(a, b Window) int { return a.Start.Compare(b.Start) })
+	base := r.buckets
+	if len(r.back) != 0 {
+		base = mergeWindows(r.buckets, r.back)
+	}
+	r.buckets = mergeWindows(base, wins)
+	r.back = nil
+	r.latest = newest
+	r.hasAny = true
+	return nil
 }
 
 // maybeFlushBack folds the backfill buffer into buckets once it holds at
