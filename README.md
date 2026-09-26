@@ -17,6 +17,8 @@ Go 1.22 or newer. Standard library only.
 - `(*Roller).Add(at time.Time, value float64) error` files a sample into its window.
 - `(*Roller).Window(start time.Time) (Window, bool)` returns a single bucket.
 - `(*Roller).Windows() []Window` returns buckets in time order.
+- `(*Roller).Range(from, to time.Time) []Window` returns the buckets overlapping `[from, to)` in time order.
+- `(*Roller).Cursor(from, to time.Time) *Cursor` snapshots a range for batched reads; `(*Cursor).Next(n int) []Window` returns the next batch, then an empty slice once the range is exhausted.
 - `(*Roller).Merge(other *Roller) error` folds another roller into this one.
 - `type Window struct { Start time.Time; Count int64; Sum, Min, Max float64 }`.
 - `rollup.ErrOutOfOrder`, `rollup.ErrWindowMismatch` error values.
