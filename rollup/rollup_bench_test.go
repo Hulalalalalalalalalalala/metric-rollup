@@ -67,6 +67,33 @@ func BenchmarkAddParallel(b *testing.B) {
 	})
 }
 
+// BenchmarkAddBackfill measures filing windows older than the newest
+// bucket after a merge; the cost must not grow with the number of
+// accepted windows.
+func BenchmarkAddBackfill(b *testing.B) {
+	r := New(time.Second)
+	if err := r.Add(time.Unix(0, 0), 0); err != nil {
+		b.Fatal(err)
+	}
+	src := benchRoller(time.Second, 0)
+	base := time.Unix(1_000_000_000_000, 0)
+	for i := 0; i < 100000; i++ {
+		if err := src.Add(base.Add(time.Duration(i)*time.Second), float64(i)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := r.Merge(src); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := r.Add(time.Unix(int64(1+i), 0), float64(i)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkWindows measures reading out the full window set.
 func BenchmarkWindows(b *testing.B) {
 	for _, n := range []int{1000, 100000} {

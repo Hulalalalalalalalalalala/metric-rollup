@@ -4,7 +4,9 @@
 // A Roller is safe for concurrent use: samples may be filed, windows read,
 // and rollers merged from multiple goroutines at once. Every read observes
 // an internally consistent snapshot, and a merge is visible to other
-// callers either in full or not at all.
+// callers either in full or not at all. A Cursor sees the windows exactly
+// as they were when the cursor was created, no matter what is filed or
+// merged while it is drained.
 package rollup
 
 import (
@@ -39,17 +41,23 @@ type Window struct {
 // The zero value is not usable; build one with New. All methods are safe
 // to call concurrently from multiple goroutines.
 type Roller struct {
-	// mu guards buckets, latest, and hasAny. window and id are fixed at
-	// construction and read without the lock.
+	// mu guards buckets, side, latest, and hasAny. window and id are fixed
+	// at construction and read without the lock.
 	//
-	// buckets is one flat slice kept sorted by window start: samples
-	// arrive in non-decreasing time order, so Add appends in amortized
-	// constant time, Windows reads out without re-sorting, and Merge is
-	// a single linear pass over both sides.
+	// buckets is the main store: one flat slice kept sorted by window
+	// start. Samples arrive in non-decreasing time order, so Add appends
+	// in amortized constant time and Merge is a single linear pass.
+	//
+	// side holds backfilled windows — ones older than the newest bucket,
+	// filed after a merge brought in later windows — in a treap keyed by
+	// window start, so a backfill insert never shifts the accepted tail
+	// of buckets. Every window start lives in exactly one of the two
+	// stores, and reads merge them back into one sorted sequence.
 	mu      sync.RWMutex
 	id      uint64
 	window  time.Duration
 	buckets []Window
+	side    *backNode
 	latest  time.Time
 	hasAny  bool
 }
@@ -166,6 +174,24 @@ func rem128(hi, lo, y uint64) uint64 {
 	return bits.Rem64(hi, lo, y)
 }
 
+// compareStart orders two window starts by wall clock alone, ignoring any
+// monotonic reading the times may carry.
+func compareStart(a, b time.Time) int {
+	if as, bs := a.Unix(), b.Unix(); as != bs {
+		if as < bs {
+			return -1
+		}
+		return 1
+	}
+	if an, bn := int64(a.Nanosecond()), int64(b.Nanosecond()); an != bn {
+		if an < bn {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
 // find locates the bucket starting at start. The second result reports
 // whether it exists; when it does not, the index is where it would be
 // inserted to keep buckets sorted.
@@ -187,6 +213,115 @@ func (r *Roller) find(start time.Time) (int, bool) {
 		}
 	}
 	return lo, false
+}
+
+// backNode is one node of the treap behind Roller.side: a binary search
+// tree keyed by window start, heap-ordered by a priority hashed from the
+// start, so it stays balanced no matter what order backfills arrive in.
+// Inserting or updating a backfilled window touches O(log n) nodes and
+// never moves the accepted tail of buckets.
+type backNode struct {
+	w           Window
+	prio        uint64
+	left, right *backNode
+}
+
+// backPrio derives a deterministic heap priority from a window start.
+func backPrio(start time.Time) uint64 {
+	x := uint64(start.Unix())*0x9E3779B97F4A7C15 + uint64(int64(start.Nanosecond()))
+	x ^= x >> 30
+	x *= 0xBF58476D1CE4E5B9
+	x ^= x >> 27
+	x *= 0x94D049BB133111EB
+	x ^= x >> 31
+	return x
+}
+
+// find returns the node holding the window that starts at start, or nil.
+func (n *backNode) find(start time.Time) *backNode {
+	for n != nil {
+		switch c := compareStart(start, n.w.Start); {
+		case c < 0:
+			n = n.left
+		case c > 0:
+			n = n.right
+		default:
+			return n
+		}
+	}
+	return nil
+}
+
+// insert adds w to the treap and returns the new root. The caller must
+// have checked that no node starts at w.Start.
+func (n *backNode) insert(w Window, prio uint64) *backNode {
+	if n == nil {
+		return &backNode{w: w, prio: prio}
+	}
+	if compareStart(w.Start, n.w.Start) < 0 {
+		n.left = n.left.insert(w, prio)
+		if n.left.prio < n.prio {
+			n = rotateRight(n)
+		}
+	} else {
+		n.right = n.right.insert(w, prio)
+		if n.right.prio < n.prio {
+			n = rotateLeft(n)
+		}
+	}
+	return n
+}
+
+func rotateRight(n *backNode) *backNode {
+	l := n.left
+	n.left = l.right
+	l.right = n
+	return l
+}
+
+func rotateLeft(n *backNode) *backNode {
+	r := n.right
+	n.right = r.left
+	r.left = n
+	return r
+}
+
+// appendTo appends every window in the treap to out, in start order.
+func (n *backNode) appendTo(out []Window) []Window {
+	if n == nil {
+		return out
+	}
+	out = n.left.appendTo(out)
+	out = append(out, n.w)
+	return n.right.appendTo(out)
+}
+
+// appendRange appends every window whose start lies in [from, to) to out,
+// in start order.
+func (n *backNode) appendRange(out []Window, from, to time.Time) []Window {
+	if n == nil {
+		return out
+	}
+	if compareStart(n.w.Start, from) >= 0 {
+		out = n.left.appendRange(out, from, to)
+		if compareStart(n.w.Start, to) < 0 {
+			out = append(out, n.w)
+		}
+	}
+	if compareStart(n.w.Start, to) < 0 {
+		out = n.right.appendRange(out, from, to)
+	}
+	return out
+}
+
+// each calls fn on every window in the treap, in start order.
+func (n *backNode) each(fn func(*Window)) {
+	if n == nil {
+		return
+	}
+	n.left.each(fn)
+	fn(&n.w)
+	n.right.each(fn)
 }
 
 // addTo folds one sample into w. Count saturates at math.MaxInt64 instead
@@ -232,13 +367,14 @@ func (r *Roller) Add(at time.Time, value float64) error {
 		}
 	default:
 		// The sample belongs to an older window, which can only happen
-		// after a merge brought in windows past latest.
+		// after a merge brought in windows past latest. Backfills land in
+		// the side treap, so filing one never shifts the accepted tail.
 		if i, ok := r.find(start); ok {
 			addTo(&r.buckets[i], value)
+		} else if bn := r.side.find(start); bn != nil {
+			addTo(&bn.w, value)
 		} else {
-			r.buckets = append(r.buckets, Window{})
-			copy(r.buckets[i+1:], r.buckets[i:])
-			r.buckets[i] = newBucket(start, value)
+			r.side = r.side.insert(newBucket(start, value), backPrio(start))
 		}
 	}
 	r.latest = at
@@ -261,6 +397,9 @@ func (r *Roller) Window(start time.Time) (Window, bool) {
 	if i, ok := r.find(start); ok {
 		return r.buckets[i], true
 	}
+	if bn := r.side.find(start); bn != nil {
+		return bn.w, true
+	}
 	return Window{}, false
 }
 
@@ -270,8 +409,97 @@ func (r *Roller) Window(start time.Time) (Window, bool) {
 func (r *Roller) Windows() []Window {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make([]Window, len(r.buckets))
-	copy(out, r.buckets)
+	return r.sortedLocked()
+}
+
+// Range returns the buckets whose start lies in [from, to), in time order.
+// The bounds follow the same left-closed, right-open convention as the
+// windows themselves: a from that lands exactly on a window start includes
+// that window, a to that lands exactly on one excludes it. An interval
+// holding no windows, from == to, and from after to all yield an empty
+// slice; none of them is an error. The result is a snapshot of one moment:
+// samples filed after the call do not alter it.
+func (r *Roller) Range(from, to time.Time) []Window {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if !from.Before(to) {
+		return []Window{}
+	}
+	// find returns the insertion point for a start, i.e. the index of the
+	// first bucket at or past the bound.
+	lo, _ := r.find(from)
+	hi, _ := r.find(to)
+	main := r.buckets[lo:hi]
+	if r.side == nil {
+		out := make([]Window, len(main))
+		copy(out, main)
+		return out
+	}
+	return unionWindows(main, r.side.appendRange(nil, from, to))
+}
+
+// sortedLocked returns every window in time order. The caller must hold
+// the lock. The result shares no memory with the roller.
+func (r *Roller) sortedLocked() []Window {
+	if r.side == nil {
+		out := make([]Window, len(r.buckets))
+		copy(out, r.buckets)
+		return out
+	}
+	return unionWindows(r.buckets, r.side.appendTo(nil))
+}
+
+// unionWindows merges two sorted window slices with no shared starts into
+// one freshly allocated sorted slice.
+func unionWindows(a, b []Window) []Window {
+	out := make([]Window, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		if compareStart(a[i].Start, b[j].Start) < 0 {
+			out = append(out, a[i])
+			i++
+		} else {
+			out = append(out, b[j])
+			j++
+		}
+	}
+	out = append(out, a[i:]...)
+	return append(out, b[j:]...)
+}
+
+// A Cursor reads a roller's windows out in batches instead of all at once.
+// It captures every window the roller holds when the cursor is created and
+// serves that snapshot from then on: samples filed, backfilled, or merged
+// afterwards are not visible to it, so a drained cursor can never tear a
+// window, skip one, or repeat one. A Cursor is not safe for concurrent use
+// by multiple goroutines.
+type Cursor struct {
+	windows []Window
+	pos     int
+}
+
+// Cursor returns a cursor over a snapshot of the roller's windows, taken
+// at the moment of the call.
+func (r *Roller) Cursor() *Cursor {
+	return &Cursor{windows: r.Windows()}
+}
+
+// Next returns the next batch of up to n windows, in time order, and
+// advances the cursor past them. Successive batches are complete and never
+// overlap. Once the snapshot is exhausted, Next returns an empty slice and
+// the cursor stays put. A non-positive n yields an empty slice without
+// advancing.
+func (c *Cursor) Next(n int) []Window {
+	if n < 0 {
+		n = 0
+	}
+	end := c.pos + n
+	if end > len(c.windows) {
+		end = len(c.windows)
+	}
+	out := make([]Window, end-c.pos)
+	copy(out, c.windows[c.pos:end])
+	c.pos = end
 	return out
 }
 
@@ -298,11 +526,14 @@ func (r *Roller) Merge(other *Roller) error {
 	if r == other {
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		for i := range r.buckets {
-			w := &r.buckets[i]
+		double := func(w *Window) {
 			w.Count = satAdd(w.Count, w.Count)
 			w.Sum += w.Sum
 		}
+		for i := range r.buckets {
+			double(&r.buckets[i])
+		}
+		r.side.each(double)
 		return nil
 	}
 	// Lock both rollers in ID order so simultaneous merges in
@@ -316,45 +547,58 @@ func (r *Roller) Merge(other *Roller) error {
 	defer second.mu.Unlock()
 	defer first.mu.Unlock()
 
-	switch {
-	case len(other.buckets) == 0:
-		return nil
-	case len(r.buckets) == 0:
-		r.buckets = append(r.buckets, other.buckets...)
+	if len(other.buckets) == 0 && other.side == nil {
 		return nil
 	}
-	// Both sides are sorted by window start, so the merge is one linear
-	// pass and one backing array, no per-bucket copies or lookups.
-	merged := make([]Window, 0, len(r.buckets)+len(other.buckets))
+	// Both stores on each side are sorted by window start, so the merge is
+	// one linear pass and one backing array, no per-bucket copies or
+	// lookups. The merged result becomes the new main store and the side
+	// treap is folded away.
+	ours := r.buckets
+	if r.side != nil {
+		ours = unionWindows(r.buckets, r.side.appendTo(nil))
+	}
+	theirs := other.buckets
+	if other.side != nil {
+		theirs = unionWindows(other.buckets, other.side.appendTo(nil))
+	}
+	r.buckets = mergeWindows(ours, theirs)
+	r.side = nil
+	return nil
+}
+
+// mergeWindows combines two sorted window slices into a freshly allocated
+// sorted slice, folding windows that share a start into one: counts and
+// sums add, minimums take the smaller, maximums take the larger.
+func mergeWindows(a, b []Window) []Window {
+	merged := make([]Window, 0, len(a)+len(b))
 	i, j := 0, 0
-	for i < len(r.buckets) && j < len(other.buckets) {
-		a, b := &r.buckets[i], &other.buckets[j]
-		switch {
-		case a.Start.Before(b.Start):
-			merged = append(merged, *a)
+	for i < len(a) && j < len(b) {
+		switch c := compareStart(a[i].Start, b[j].Start); {
+		case c < 0:
+			merged = append(merged, a[i])
 			i++
-		case b.Start.Before(a.Start):
-			merged = append(merged, *b)
+		case c > 0:
+			merged = append(merged, b[j])
 			j++
 		default:
-			w := *a
-			w.Count = satAdd(w.Count, b.Count)
-			w.Sum += b.Sum
-			if b.Min < w.Min {
-				w.Min = b.Min
+			w := a[i]
+			w.Count = satAdd(w.Count, b[j].Count)
+			w.Sum += b[j].Sum
+			if b[j].Min < w.Min {
+				w.Min = b[j].Min
 			}
-			if b.Max > w.Max {
-				w.Max = b.Max
+			if b[j].Max > w.Max {
+				w.Max = b[j].Max
 			}
 			merged = append(merged, w)
 			i++
 			j++
 		}
 	}
-	merged = append(merged, r.buckets[i:]...)
-	merged = append(merged, other.buckets[j:]...)
-	r.buckets = merged
-	return nil
+	merged = append(merged, a[i:]...)
+	merged = append(merged, b[j:]...)
+	return merged
 }
 
 // satAdd returns a + b saturated at math.MaxInt64 instead of overflowing.
