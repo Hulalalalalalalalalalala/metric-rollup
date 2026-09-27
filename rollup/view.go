@@ -24,9 +24,10 @@ type View struct {
 // times wider than the roller's own, aligned to integer multiples of the
 // coarser size since the Unix epoch, left-closed and right-open exactly
 // like the roller's windows. Each coarse window merges the statistics of
-// the roller windows it covers: counts and sums add, minimums take the
-// smaller, maximums take the larger. A factor of 1 yields a view
-// window-for-window identical to the roller's own.
+// the roller windows it covers under the same fixed sum and extrema
+// semantics as merging: exact sums combine and round once, a minimum
+// takes the smaller, and a maximum takes the larger. A factor of 1 yields
+// a view window-for-window identical to the roller's own.
 //
 // Rollup panics with "rollup: bad factor" if factor is not positive, or if
 // factor times the roller's window width overflows the range of a
@@ -47,34 +48,28 @@ func (r *Roller) Rollup(factor int) *View {
 
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	fine := r.buckets
-	if len(r.back) != 0 {
-		fine = mergeWindows(r.buckets, r.sortedBackLocked())
-	}
+	fine, fstats := r.snapshotStatsLocked()
 	// The coarse start is monotone in the fine start, so covered windows
 	// are consecutive and the whole derivation is one linear pass with a
 	// single output allocation bounded by the number of fine windows.
 	windows := make([]Window, 0, len(fine))
-	for _, f := range fine {
+	cstats := make([]stats, 0, len(fine))
+	for i := range fine {
+		f := fine[i]
 		start := alignStart(f.Start, w)
 		if n := len(windows); n != 0 && windows[n-1].Start.Equal(start) {
-			cur := &windows[n-1]
-			cur.Count = satAdd(cur.Count, f.Count)
-			cur.Sum += f.Sum
-			if f.Min < cur.Min {
-				cur.Min = f.Min
-			}
-			if f.Max > cur.Max {
-				cur.Max = f.Max
-			}
+			combineWindow(&windows[n-1], &cstats[n-1], &f, &fstats[i])
 		} else {
-			windows = append(windows, Window{
+			st := cloneStats(fstats[i])
+			cw := Window{
 				Start: start,
 				Count: f.Count,
 				Sum:   f.Sum,
 				Min:   f.Min,
 				Max:   f.Max,
-			})
+			}
+			windows = append(windows, canonicalWindow(cw, &st))
+			cstats = append(cstats, st)
 		}
 	}
 	return &View{window: coarse, windows: windows}
@@ -95,8 +90,8 @@ func (v *View) Window(start time.Time) Window {
 // Range returns the coarse windows overlapping the half-open interval
 // [from, to), in time order, selected by the same rule as the roller's
 // Range: the first window returned is the one containing from, and a
-// window starting exactly at to is excluded. An interval whose end does
-// not come after its start yields an empty slice, as does an interval no
+// window starting exactly at to is excluded. An interval whose end does not
+// come after its start yields an empty slice, as does an interval no
 // coarse window overlaps.
 func (v *View) Range(from, to time.Time) []Window {
 	out := []Window{}

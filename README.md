@@ -26,7 +26,7 @@ that cannot be combined.
 ## Public interface
 
 `rollup.New(window time.Duration) *Roller` builds a roller.
-- `(*Roller).Add(at time.Time, value float64) error` files a sample into its window.
+- `(*Roller).Add(at time.Time, value float64) error` files a sample into its window. NaN and either infinity are rejected with `ErrNonFinite`.
 - `(*Roller).AddBatch(samples []Sample) error` files a batch of samples atomically: all of them or none.
 - `type Sample struct { At time.Time; Value float64 }`.
 - `(*Roller).Window(start time.Time) (Window, bool)` returns a single bucket.
@@ -39,7 +39,27 @@ that cannot be combined.
 - `(*View).Range(from, to time.Time) []Window` returns the coarse windows overlapping `[from, to)` in time order.
 - `(*View).Cursor(from, to time.Time) *Cursor` snapshots a coarse range for batched reads.
 - `type Window struct { Start time.Time; Count int64; Sum, Min, Max float64 }`.
-- `rollup.ErrOutOfOrder`, `rollup.ErrWindowMismatch` error values.
+- `rollup.ErrOutOfOrder`, `rollup.ErrWindowMismatch`, `rollup.ErrNonFinite` error values.
+
+### Numeric semantics
+
+The statistics of a window are fixed by its sample set, not by the order
+or interleaving in which the samples arrived, so the same set read out
+through any command path always compares bit for bit.
+
+- The sum is the exact real sum of the finite samples, rounded to
+  float64 once; submission order cannot change any bit.
+- A zero sum is a negative zero only when every sample in the window is a
+  negative zero; otherwise it is a positive zero.
+- A minimum equal to zero is a negative zero when the window holds a
+  negative-zero sample; a maximum equal to zero is a negative zero only
+  when there is no positive-zero sample.
+- A sum outside the float64 range rounds to `+Inf` or `-Inf`. Merging a
+  positive-infinity window with a negative-infinity one yields `NaN`.
+- NaN and infinity sample values are never filed; they are rejected with
+  `ErrNonFinite`, and a rejected batch leaves the roller unchanged.
+- The count saturates at the int64 ceiling and stops growing; the sum and
+  extrema keep updating.
 
 ## Tests
 
