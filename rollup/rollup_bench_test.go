@@ -92,6 +92,43 @@ func BenchmarkWindow(b *testing.B) {
 	}
 }
 
+// BenchmarkMassBackfill measures the post-merge backfill path, the one
+// write path that used to be quadratic: one merged-in window far ahead of
+// the accepted marker, then every gap window filed newest-first in a
+// single batch. Time must scale near-linearly with the window count and
+// the temporary working set stay bounded by the windows themselves.
+func BenchmarkMassBackfill(b *testing.B) {
+	for _, n := range []int{1000, 10000, 100000, 1000000} {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			batch := make([]Sample, 0, n)
+			for i := n; i >= 1; i-- {
+				batch = append(batch, Sample{At: time.Unix(int64(i)*60, 0), Value: 1})
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for k := 0; k < b.N; k++ {
+				a := New(time.Minute)
+				if err := a.Add(time.Unix(0, 0), 1); err != nil {
+					b.Fatal(err)
+				}
+				src := New(time.Minute)
+				if err := src.Add(time.Unix(int64(n+1)*60, 0), 1); err != nil {
+					b.Fatal(err)
+				}
+				if err := a.Merge(src); err != nil {
+					b.Fatal(err)
+				}
+				if err := a.AddBatch(batch); err != nil {
+					b.Fatal(err)
+				}
+				if got := len(a.Windows()); got != n+2 {
+					b.Fatalf("got %d windows, want %d", got, n+2)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkMerge measures folding two rollers of n windows each together,
 // both fully overlapping and fully disjoint.
 func BenchmarkMerge(b *testing.B) {

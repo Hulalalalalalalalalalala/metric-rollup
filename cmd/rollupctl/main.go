@@ -144,7 +144,7 @@ func runMerge(pathA, pathB string, d time.Duration, stdout, stderr io.Writer) in
 		return code
 	}
 	if err := rollerA.Merge(rollerB); err != nil {
-		fmt.Fprintf(stderr, "rollupctl: %s %s: %v\n", pathA, pathB, err)
+		writeMergeError(stderr, pathA, pathB, err)
 		return 4
 	}
 	out := bufio.NewWriter(stdout)
@@ -173,6 +173,13 @@ func flush(out *bufio.Writer, stderr io.Writer) int {
 // argError writes one command-line usage diagnostic.
 func argError(stderr io.Writer, format string, a ...any) {
 	fmt.Fprintf(stderr, "rollupctl: "+format+"\n", a...)
+}
+
+// writeMergeError writes the one merge diagnostic: the two file names in
+// command-line order, separated by a comma and a space, followed by the
+// reason the merge could not combine them.
+func writeMergeError(stderr io.Writer, pathA, pathB string, err error) {
+	fmt.Fprintf(stderr, "rollupctl: %s, %s: %v\n", pathA, pathB, err)
 }
 
 // parseArgs extracts the subcommand and the flag values. Flags may stand

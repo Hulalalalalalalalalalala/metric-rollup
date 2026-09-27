@@ -49,7 +49,7 @@ func (r *Roller) Rollup(factor int) *View {
 	defer r.mu.RUnlock()
 	fine := r.buckets
 	if len(r.back) != 0 {
-		fine = mergeWindows(r.buckets, r.back)
+		fine = mergeWindows(r.buckets, r.sortedBackLocked())
 	}
 	// The coarse start is monotone in the fine start, so covered windows
 	// are consecutive and the whole derivation is one linear pass with a

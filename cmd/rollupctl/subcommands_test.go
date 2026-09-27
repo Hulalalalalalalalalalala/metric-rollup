@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Hulalalalalalalalalalala/metric-rollup/rollup"
 )
 
 // runWithFiles writes each named content to its own file and runs the
@@ -273,5 +276,23 @@ func TestMergeFileAndContentErrors(t *testing.T) {
 	got = runWithFiles(t, files, "--file", "good.txt", "--file", "empty.txt", "--window", "1s", "merge")
 	if got.code != 4 || !strings.Contains(got.stderr, ":0:") || got.stdout != "" {
 		t.Fatalf("empty second file: code = %d, stdout = %q, stderr = %q", got.code, got.stdout, got.stderr)
+	}
+}
+
+// TestMergeMismatchDiagnostic pins the one piece of merge output the
+// contract writes to the letter: when the widths differ, the two file
+// names appear in command-line order, separated by a comma and a space,
+// on the single stderr diagnostic line. The mismatched-width state is
+// unreachable through one --window flag, so the formatting unit is
+// exercised directly.
+func TestMergeMismatchDiagnostic(t *testing.T) {
+	var stderr bytes.Buffer
+	writeMergeError(&stderr, "first.txt", "second.txt", rollup.ErrWindowMismatch)
+	want := "rollupctl: first.txt, second.txt: rollup: window mismatch\n"
+	if stderr.String() != want {
+		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
+	}
+	if strings.Count(strings.TrimRight(stderr.String(), "\n"), "\n") != 0 {
+		t.Fatalf("stderr must be one line: %q", stderr.String())
 	}
 }
