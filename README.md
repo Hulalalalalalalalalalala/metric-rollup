@@ -10,11 +10,21 @@ Go 1.22 or newer. Standard library only.
 
     go build ./...
     go run ./cmd/rollupctl --file <path> --window <duration> windows
+    go run ./cmd/rollupctl --file <path> --window <duration> --from <ns> --to <ns> range
+    go run ./cmd/rollupctl --file <path> --file <path> --window <duration> merge
 
 `rollupctl` reads one sample per line — nanoseconds since the epoch,
 whitespace, then a float — and prints, per window, its epoch-aligned start,
-count, sum, minimum, and maximum. Exit codes: 2 for bad arguments, 3 if the
-file is missing or a directory, 4 for invalid file contents.
+count, sum, minimum, and maximum. `windows` prints every window; `range`
+prints only the windows overlapping the half-open interval `[--from,
+--to)`, with both endpoints given as signed integer nanoseconds since the
+epoch and equal or backwards endpoints printing nothing; `merge` ingests
+two files that share the window duration and prints their windows combined,
+folding windows that start at the same instant into one line. Both new
+paths stream their input line by line, and `range` advances through an
+existing `Cursor` in batches instead of materializing the whole interval.
+Exit codes: 2 for bad arguments, 3 if a file is missing or a directory, 4
+for invalid file contents or a merge that cannot be combined.
 
 ## Public interface
 
