@@ -1,6 +1,9 @@
 package rollup
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // View is a read-only derived view of a Roller at a coarser window size.
 // Each view window covers a fixed number of the roller's own windows and
@@ -25,12 +28,18 @@ type View struct {
 // smaller, maximums take the larger. A factor of 1 yields a view
 // window-for-window identical to the roller's own.
 //
-// Rollup panics with "rollup: bad factor" if factor is not positive. It
-// is a pure read: the roller's statistics and its most-recent marker are
-// untouched, and concurrent adds, batches, backfills, and merges proceed
-// as usual — the view observes one consistent snapshot of the roller.
+// Rollup panics with "rollup: bad factor" if factor is not positive, or if
+// factor times the roller's window width overflows the range of a
+// nanosecond duration: a wrapped coarse width could not align windows to
+// the epoch. It is a pure read: the roller's statistics and its most-recent
+// marker are untouched, and concurrent adds, batches, backfills, and merges
+// proceed as usual — the view observes one consistent snapshot of the
+// roller.
 func (r *Roller) Rollup(factor int) *View {
 	if factor <= 0 {
+		panic("rollup: bad factor")
+	}
+	if int64(factor) > math.MaxInt64/r.window.Nanoseconds() {
 		panic("rollup: bad factor")
 	}
 	coarse := time.Duration(factor) * r.window

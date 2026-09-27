@@ -9,7 +9,12 @@ Go 1.22 or newer. Standard library only.
 ## Build
 
     go build ./...
-    go run ./cmd/rollupctl --file <path> windows
+    go run ./cmd/rollupctl --file <path> --window <duration> windows
+
+`rollupctl` reads one sample per line — nanoseconds since the epoch,
+whitespace, then a float — and prints, per window, its epoch-aligned start,
+count, sum, minimum, and maximum. Exit codes: 2 for bad arguments, 3 if the
+file is missing or a directory, 4 for invalid file contents.
 
 ## Public interface
 
