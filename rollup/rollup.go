@@ -25,6 +25,11 @@ var ErrOutOfOrder = errors.New("rollup: out of order")
 // window sizes.
 var ErrWindowMismatch = errors.New("rollup: window mismatch")
 
+// ErrNonFinite is returned by Add and AddBatch when a sample value is NaN
+// or either infinity. Such a value is not filed and leaves the roller
+// unchanged; a batch containing one takes no effect at all.
+var ErrNonFinite = errors.New("rollup: non-finite value")
+
 // Sample is one record in a batch passed to AddBatch: a value observed at
 // one instant.
 type Sample struct {
@@ -53,7 +58,9 @@ type Roller struct {
 	// buckets is one flat slice kept sorted by window start: samples
 	// arrive in non-decreasing time order, so Add appends in amortized
 	// constant time, Windows reads out without re-sorting, and Merge is
-	// a single linear pass over both sides.
+	// a single linear pass over both sides. sums[i] holds the exact,
+	// order-independent total for buckets[i]; the Sum field there is
+	// finalized only when a window is read.
 	//
 	// back holds backfilled windows keyed by window start: a sample that
 	// lands before the newest window opens its bucket here, so a new
@@ -62,12 +69,14 @@ type Roller struct {
 	// catches up with buckets, they are sorted once and folded into it,
 	// amortizing that sort over the inserts. Every read consults both
 	// buckets and back, and no window start appears in both at the same
-	// time.
+	// time. backAgg holds back's exact totals the same way sums does.
 	mu      sync.RWMutex
 	id      uint64
 	window  time.Duration
 	buckets []Window
+	sums    []*agg
 	back    map[time.Time]Window
+	backAgg map[time.Time]*agg
 	latest  time.Time
 	hasAny  bool
 }
@@ -213,13 +222,30 @@ func windowIndex(ws []Window, start time.Time) (int, bool) {
 	return lo, false
 }
 
-// addTo folds one sample into w. Count saturates at math.MaxInt64 instead
-// of overflowing; Sum, Min, and Max keep updating afterwards.
-func addTo(w *Window, value float64) {
+// bucketAggLocked returns the accumulator for buckets[i], seeding and
+// storing one from the bucket's fields if it entered the roller without
+// an accumulator. The caller must hold mu.
+func (r *Roller) bucketAggLocked(i int) *agg {
+	for len(r.sums) < len(r.buckets) {
+		r.sums = append(r.sums, nil)
+	}
+	if r.sums[i] == nil {
+		r.sums[i] = seedAgg(r.buckets[i])
+	}
+	return r.sums[i]
+}
+
+// addTo folds one finite sample into w, keeping both the legacy running
+// fields and the exact accumulator a. Count saturates at math.MaxInt64
+// instead of overflowing; Sum, Min, and Max keep updating afterwards. The
+// Sum field is provisional: reads replace it with the value finalized
+// from a, and its zero signs follow a as well.
+func addTo(w *Window, a *agg, value float64) {
 	if w.Count < math.MaxInt64 {
 		w.Count++
 	}
 	w.Sum += value
+	a.add(value)
 	if value < w.Min {
 		w.Min = value
 	}
@@ -228,14 +254,20 @@ func addTo(w *Window, value float64) {
 	}
 }
 
-// Add files a sample into its window. A sample earlier than the most recent
-// accepted sample is rejected with ErrOutOfOrder and leaves the roller
-// unchanged; a sample at the same instant is accepted and counted again.
+// Add files a sample into its window. A NaN or infinite value is refused
+// with ErrNonFinite before anything else and leaves the roller, including
+// its most-recent marker, unchanged. A sample earlier than the most recent
+// accepted sample is rejected with ErrOutOfOrder and also leaves the
+// roller unchanged; a sample at the same instant is accepted and counted
+// again.
 //
 // Concurrent Adds are serialized: each takes effect in the order it
 // acquires the roller, and the out-of-order check is measured against the
 // samples accepted before it in that order.
 func (r *Roller) Add(at time.Time, value float64) error {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return ErrNonFinite
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.hasAny && at.Before(r.latest) {
@@ -253,12 +285,14 @@ func (r *Roller) Add(at time.Time, value float64) error {
 // instant are each counted. Each sample is filed into its epoch-aligned
 // window exactly as Add would file it.
 //
-// If any sample predates the most recent sample the roller has already
-// accepted, the whole batch is rejected with ErrOutOfOrder and the roller
-// is left unchanged. Otherwise the most-recent marker advances to the
-// later of its previous value and the newest sample in the batch. A nil
-// or empty batch is accepted, changes nothing, and does not advance the
-// marker.
+// If any sample holds a NaN or infinite value, the whole batch is
+// rejected with ErrNonFinite before the ordering check. If any sample
+// predates the most recent sample the roller has already accepted, the
+// whole batch is rejected with ErrOutOfOrder; either rejection leaves the
+// roller and its most-recent marker untouched. Otherwise the marker
+// advances to the later of its previous value and the newest sample in
+// the batch. A nil or empty batch is accepted, changes nothing, and does
+// not advance the marker.
 //
 // The batch is atomic with respect to every other call on the roller:
 // concurrent adds, batches, merges, range reads, and cursor creation
@@ -266,6 +300,13 @@ func (r *Roller) Add(at time.Time, value float64) error {
 func (r *Roller) AddBatch(samples []Sample) error {
 	if len(samples) == 0 {
 		return nil
+	}
+	// A non-finite value rejects the batch outright, before the
+	// out-of-order check and without touching the roller.
+	for _, s := range samples {
+		if math.IsNaN(s.Value) || math.IsInf(s.Value, 0) {
+			return ErrNonFinite
+		}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -292,21 +333,26 @@ func (r *Roller) AddBatch(samples []Sample) error {
 	return nil
 }
 
-// fileLocked folds one sample into its window. The caller must hold mu
-// and must already have cleared the out-of-order check.
+// fileLocked folds one finite sample into its window. The caller must
+// hold mu and must already have cleared the out-of-order and non-finite
+// checks.
 func (r *Roller) fileLocked(at time.Time, value float64) {
 	start := r.startOf(at)
 	n := len(r.buckets)
 	switch {
 	case n == 0:
-		r.buckets = append(r.buckets, newBucket(start, value))
+		w, a := newBucket(start, value)
+		r.buckets = append(r.buckets, w)
+		r.sums = append(r.sums, a)
 	case !start.Before(r.buckets[n-1].Start):
 		// The common case: the sample lands in the newest window or
 		// just past it, so the sorted order is maintained for free.
 		if r.buckets[n-1].Start.Equal(start) {
-			addTo(&r.buckets[n-1], value)
+			addTo(&r.buckets[n-1], r.bucketAggLocked(n-1), value)
 		} else {
-			r.buckets = append(r.buckets, newBucket(start, value))
+			w, a := newBucket(start, value)
+			r.buckets = append(r.buckets, w)
+			r.sums = append(r.sums, a)
 		}
 	default:
 		// The sample belongs to an older window, which can only happen
@@ -316,23 +362,34 @@ func (r *Roller) fileLocked(at time.Time, value float64) {
 		// buckets and the cost of a mass backfill stays linear in the
 		// number of windows accepted.
 		if i, ok := windowIndex(r.buckets, start); ok {
-			addTo(&r.buckets[i], value)
+			addTo(&r.buckets[i], r.bucketAggLocked(i), value)
 		} else if w, ok := r.back[start]; ok {
-			addTo(&w, value)
+			a := r.backAgg[start]
+			if a == nil {
+				a = seedAgg(w)
+				r.backAgg[start] = a
+			}
+			addTo(&w, a, value)
 			r.back[start] = w
 		} else {
 			if r.back == nil {
 				r.back = make(map[time.Time]Window)
+				r.backAgg = make(map[time.Time]*agg)
 			}
-			r.back[start] = newBucket(start, value)
+			w, a := newBucket(start, value)
+			r.back[start] = w
+			r.backAgg[start] = a
 			r.maybeFlushBack()
 		}
 	}
 }
 
-// newBucket returns a window holding a single sample.
-func newBucket(start time.Time, value float64) Window {
-	return Window{Start: start, Count: 1, Sum: value, Min: value, Max: value}
+// newBucket returns a window holding a single finite sample, paired with
+// its exact accumulator.
+func newBucket(start time.Time, value float64) (Window, *agg) {
+	a := newAgg()
+	a.add(value)
+	return Window{Start: start, Count: 1, Sum: value, Min: value, Max: value}, a
 }
 
 // maybeFlushBack folds the backfilled windows into buckets once they
@@ -343,37 +400,84 @@ func (r *Roller) maybeFlushBack() {
 	if len(r.back)*2 < len(r.buckets) {
 		return
 	}
-	r.buckets = mergeWindows(r.buckets, r.sortedBackLocked())
+	bw, ba := r.sortedBackLocked()
+	r.buckets, r.sums = mergeWindows(r.buckets, r.sums, bw, ba, true)
 	r.back = nil
+	r.backAgg = nil
 }
 
-// sortedBackLocked returns the backfilled windows in time order. The
-// caller must hold mu; the returned slice is a fresh snapshot.
-func (r *Roller) sortedBackLocked() []Window {
+// sortedBackLocked returns the backfilled windows in time order, each
+// paired with its accumulator. The caller must hold mu; the returned
+// slices are a fresh snapshot.
+func (r *Roller) sortedBackLocked() ([]Window, []*agg) {
 	back := make([]Window, 0, len(r.back))
-	for _, w := range r.back {
+	aggs := make([]*agg, 0, len(r.back))
+	for start, w := range r.back {
+		a := r.backAgg[start]
+		if a == nil {
+			a = seedAgg(w)
+		}
 		back = append(back, w)
+		aggs = append(aggs, a)
 	}
-	sort.Slice(back, func(i, j int) bool {
-		return back[i].Start.Before(back[j].Start)
+	order := make([]int, len(back))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool {
+		return back[order[i]].Start.Before(back[order[j]].Start)
 	})
-	return back
+	sortedW := make([]Window, len(back))
+	sortedA := make([]*agg, len(aggs))
+	for i, k := range order {
+		sortedW[i] = back[k]
+		sortedA[i] = aggs[k]
+	}
+	return sortedW, sortedA
 }
 
-// mergeWindows returns the sorted union of two window slices, each sorted
-// by window start, combining the statistics of windows that share a
-// start: counts and sums add, minimums take the smaller, maximums take
-// the larger. The result is always a fresh slice.
-func mergeWindows(a, b []Window) []Window {
+// aggAt returns the accumulator for entry i of ws, seeding one from the
+// window when the side carries none (test-built buckets). It never
+// mutates the passed slice: a seeded accumulator is returned fresh.
+func aggAt(ag []*agg, i int, w Window) *agg {
+	if i < len(ag) && ag[i] != nil {
+		return ag[i]
+	}
+	return seedAgg(w)
+}
+
+// mergeWindows returns the sorted union of two window sides, each sorted
+// by window start, combining statistics of windows that share a start:
+// counts and sums add, minimums take the smaller, maximums take the
+// larger.
+//
+// The a side is the destination's own windows and is being replaced by
+// the caller, so its accumulator pointers are reused in place, which
+// keeps a mass backfill linear with no per-carried-window allocation.
+// The b side belongs to another roller (or, when ownB is true as in a
+// backfill flush, to this same roller): a b-only window reuses its
+// accumulator when ownB and otherwise gets a fresh deep copy, so another
+// roller's state is never mutated or shared. Overlapping starts merge b
+// into a's accumulator in place; b is never written.
+func mergeWindows(a []Window, aa []*agg, b []Window, bb []*agg, ownB bool) ([]Window, []*agg) {
 	merged := make([]Window, 0, len(a)+len(b))
+	mergedAgg := make([]*agg, 0, len(a)+len(b))
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
 		switch {
 		case a[i].Start.Before(b[j].Start):
 			merged = append(merged, a[i])
+			mergedAgg = append(mergedAgg, aggAt(aa, i, a[i]))
 			i++
 		case b[j].Start.Before(a[i].Start):
 			merged = append(merged, b[j])
+			if ownB {
+				mergedAgg = append(mergedAgg, aggAt(bb, j, b[j]))
+			} else {
+				x := newAgg()
+				x.take(aggAt(bb, j, b[j]))
+				mergedAgg = append(mergedAgg, x)
+			}
 			j++
 		default:
 			w := a[i]
@@ -385,14 +489,29 @@ func mergeWindows(a, b []Window) []Window {
 			if b[j].Max > w.Max {
 				w.Max = b[j].Max
 			}
+			x := aggAt(aa, i, a[i])
+			x.merge(aggAt(bb, j, b[j]))
 			merged = append(merged, w)
+			mergedAgg = append(mergedAgg, x)
 			i++
 			j++
 		}
 	}
-	merged = append(merged, a[i:]...)
-	merged = append(merged, b[j:]...)
-	return merged
+	for ; i < len(a); i++ {
+		merged = append(merged, a[i])
+		mergedAgg = append(mergedAgg, aggAt(aa, i, a[i]))
+	}
+	for ; j < len(b); j++ {
+		merged = append(merged, b[j])
+		if ownB {
+			mergedAgg = append(mergedAgg, aggAt(bb, j, b[j]))
+		} else {
+			x := newAgg()
+			x.take(aggAt(bb, j, b[j]))
+			mergedAgg = append(mergedAgg, x)
+		}
+	}
+	return merged, mergedAgg
 }
 
 // Window returns the bucket whose start matches start exactly. The second
@@ -403,12 +522,84 @@ func (r *Roller) Window(start time.Time) (Window, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if i, ok := windowIndex(r.buckets, start); ok {
-		return r.buckets[i], true
+		return finalize(r.buckets[i], aggAt(r.sums, i, r.buckets[i])), true
 	}
-	if w, ok := r.back[start.UTC()]; ok {
-		return w, true
+	key := start.UTC()
+	if w, ok := r.back[key]; ok {
+		return finalize(w, r.backAgg[key]), true
 	}
 	return Window{}, false
+}
+
+// windowsLocked returns every window in time order, finalized, merged
+// from buckets and the backfill map. It is the read path: it allocates
+// the single output window slice and nothing else, so tight snapshot
+// loops cost no more than copying the windows. The caller must hold mu.
+func (r *Roller) windowsLocked() []Window {
+	if len(r.back) == 0 {
+		ws := make([]Window, len(r.buckets))
+		for i := range r.buckets {
+			ws[i] = finalize(r.buckets[i], aggAt(r.sums, i, r.buckets[i]))
+		}
+		return ws
+	}
+	bw, ba := r.sortedBackLocked()
+	ws := make([]Window, 0, len(r.buckets)+len(bw))
+	i, j := 0, 0
+	for i < len(r.buckets) && j < len(bw) {
+		if bw[j].Start.Before(r.buckets[i].Start) {
+			ws = append(ws, finalize(bw[j], ba[j]))
+			j++
+		} else {
+			ws = append(ws, finalize(r.buckets[i], aggAt(r.sums, i, r.buckets[i])))
+			i++
+		}
+	}
+	for ; i < len(r.buckets); i++ {
+		ws = append(ws, finalize(r.buckets[i], aggAt(r.sums, i, r.buckets[i])))
+	}
+	for ; j < len(bw); j++ {
+		ws = append(ws, finalize(bw[j], ba[j]))
+	}
+	return ws
+}
+
+// snapshotLocked returns every window in time order paired with its live
+// accumulator, merged from buckets and the backfill map. It is the merge
+// path: the accumulators are read-only here and folded into fresh copies
+// by mergeWindows. The caller must hold mu.
+//
+// buckets and the backfill map are disjoint in window starts by
+// construction, so their union is a plain interleave: no statistics ever
+// combine here.
+func (r *Roller) snapshotLocked() ([]Window, []*agg) {
+	if len(r.back) == 0 {
+		ws := make([]Window, len(r.buckets))
+		copy(ws, r.buckets)
+		return ws, r.sums
+	}
+	bw, ba := r.sortedBackLocked()
+	ws := make([]Window, 0, len(r.buckets)+len(bw))
+	as := make([]*agg, 0, len(r.buckets)+len(bw))
+	i, j := 0, 0
+	for i < len(r.buckets) && j < len(bw) {
+		if bw[j].Start.Before(r.buckets[i].Start) {
+			ws = append(ws, bw[j])
+			as = append(as, ba[j])
+			j++
+		} else {
+			ws = append(ws, r.buckets[i])
+			as = append(as, aggAt(r.sums, i, r.buckets[i]))
+			i++
+		}
+	}
+	for ; i < len(r.buckets); i++ {
+		ws = append(ws, r.buckets[i])
+		as = append(as, aggAt(r.sums, i, r.buckets[i]))
+	}
+	ws = append(ws, bw[j:]...)
+	as = append(as, ba[j:]...)
+	return ws, as
 }
 
 // Windows returns all buckets in time order. An empty roller yields an
@@ -417,12 +608,7 @@ func (r *Roller) Window(start time.Time) (Window, bool) {
 func (r *Roller) Windows() []Window {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if len(r.back) != 0 {
-		return mergeWindows(r.buckets, r.sortedBackLocked())
-	}
-	out := make([]Window, len(r.buckets))
-	copy(out, r.buckets)
-	return out
+	return r.windowsLocked()
 }
 
 // Range returns the buckets that overlap the half-open interval
@@ -440,30 +626,35 @@ func (r *Roller) Range(from, to time.Time) []Window {
 	if !from.Before(to) {
 		return out
 	}
-	back := []Window(nil)
-	if len(r.back) != 0 {
-		back = r.sortedBackLocked()
-	}
 	lo := r.startOf(from)
 	i, _ := windowIndex(r.buckets, lo)
-	j, _ := windowIndex(back, lo)
-	for {
+	if len(r.back) == 0 {
+		for ; i < len(r.buckets); i++ {
+			if !r.buckets[i].Start.Before(to) {
+				break
+			}
+			out = append(out, finalize(r.buckets[i], aggAt(r.sums, i, r.buckets[i])))
+		}
+		return out
+	}
+	bw, ba := r.sortedBackLocked()
+	j, _ := windowIndex(bw, lo)
+	for i < len(r.buckets) || j < len(bw) {
 		var w Window
 		switch {
-		case i < len(r.buckets) && (j >= len(back) || r.buckets[i].Start.Before(back[j].Start)):
-			w = r.buckets[i]
+		case j >= len(bw) || (i < len(r.buckets) && r.buckets[i].Start.Before(bw[j].Start)):
+			w = finalize(r.buckets[i], aggAt(r.sums, i, r.buckets[i]))
 			i++
-		case j < len(back):
-			w = back[j]
-			j++
 		default:
-			return out
+			w = finalize(bw[j], ba[j])
+			j++
 		}
 		if !w.Start.Before(to) {
-			return out
+			break
 		}
 		out = append(out, w)
 	}
+	return out
 }
 
 // Cursor reads a fixed range of windows in batches. The windows are
@@ -534,13 +725,16 @@ func (r *Roller) Merge(other *Roller) error {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		if len(r.back) != 0 {
-			r.buckets = mergeWindows(r.buckets, r.sortedBackLocked())
+			bw, ba := r.sortedBackLocked()
+			r.buckets, r.sums = mergeWindows(r.buckets, r.sums, bw, ba, true)
 			r.back = nil
+			r.backAgg = nil
 		}
 		for i := range r.buckets {
 			w := &r.buckets[i]
 			w.Count = satAdd(w.Count, w.Count)
 			w.Sum += w.Sum
+			r.bucketAggLocked(i).double()
 		}
 		return nil
 	}
@@ -555,24 +749,28 @@ func (r *Roller) Merge(other *Roller) error {
 	defer second.mu.Unlock()
 	defer first.mu.Unlock()
 
-	switch {
-	case len(other.buckets) == 0 && len(other.back) == 0:
-		return nil
-	case len(r.buckets) == 0 && len(r.back) == 0:
-		r.buckets = mergeWindows(other.buckets, other.sortedBackLocked())
+	if len(other.buckets) == 0 && len(other.back) == 0 {
 		return nil
 	}
-	left, right := r.buckets, other.buckets
-	if len(r.back) != 0 {
-		left = mergeWindows(r.buckets, r.sortedBackLocked())
+	right, rightAgg := other.snapshotLocked()
+	if len(r.buckets) == 0 && len(r.back) == 0 {
+		// Adopt other's windows, but own independent accumulators so the
+		// two rollers never share one.
+		r.buckets = right
+		r.sums = make([]*agg, len(rightAgg))
+		for k, x := range rightAgg {
+			c := newAgg()
+			c.take(x)
+			r.sums[k] = c
+		}
+		return nil
 	}
-	if len(other.back) != 0 {
-		right = mergeWindows(other.buckets, other.sortedBackLocked())
-	}
+	left, leftAgg := r.snapshotLocked()
 	// Both sides are sorted by window start, so the merge is one linear
 	// pass and one backing array, no per-bucket copies or lookups.
-	r.buckets = mergeWindows(left, right)
+	r.buckets, r.sums = mergeWindows(left, leftAgg, right, rightAgg, false)
 	r.back = nil
+	r.backAgg = nil
 	return nil
 }
 

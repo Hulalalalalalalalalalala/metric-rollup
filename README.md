@@ -26,20 +26,20 @@ that cannot be combined.
 ## Public interface
 
 `rollup.New(window time.Duration) *Roller` builds a roller.
-- `(*Roller).Add(at time.Time, value float64) error` files a sample into its window.
-- `(*Roller).AddBatch(samples []Sample) error` files a batch of samples atomically: all of them or none.
+- `(*Roller).Add(at time.Time, value float64) error` files a sample into its window. A window's sum is a function of its sample set alone: the exact finite magnitudes are accumulated and rounded to float64 once on read, so submission order and concurrency interleave never change a digit. A sum past the float64 range reads as `+Inf` or `-Inf`; positive and negative infinities together read as `NaN`. An exact-zero sum is `-0` only when every sample was a negative zero. Extrema pin the sign of zero the same way. Non-finite values are refused.
+- `(*Roller).AddBatch(samples []Sample) error` files a batch of samples atomically: all of them or none; a batch holding a non-finite value is refused and changes nothing.
 - `type Sample struct { At time.Time; Value float64 }`.
 - `(*Roller).Window(start time.Time) (Window, bool)` returns a single bucket.
 - `(*Roller).Windows() []Window` returns buckets in time order.
 - `(*Roller).Range(from, to time.Time) []Window` returns the buckets overlapping `[from, to)` in time order.
 - `(*Roller).Cursor(from, to time.Time) *Cursor` snapshots a range for batched reads; `(*Cursor).Next(n int) []Window` returns the next batch, then an empty slice once the range is exhausted.
-- `(*Roller).Merge(other *Roller) error` folds another roller into this one.
+- `(*Roller).Merge(other *Roller) error` folds another roller into this one; it neither advances the most-recent marker nor feeds out-of-order tracking, so older samples may still be filed afterwards.
 - `(*Roller).Rollup(factor int) *View` derives a read-only view whose windows are `factor` times wider, merged from the roller's own windows; it panics with `rollup: bad factor` if `factor <= 0`.
 - `(*View).Window(start time.Time) Window` returns the coarse window starting at `start`, or a zero `Window` (count 0) if none does.
 - `(*View).Range(from, to time.Time) []Window` returns the coarse windows overlapping `[from, to)` in time order.
 - `(*View).Cursor(from, to time.Time) *Cursor` snapshots a coarse range for batched reads.
 - `type Window struct { Start time.Time; Count int64; Sum, Min, Max float64 }`.
-- `rollup.ErrOutOfOrder`, `rollup.ErrWindowMismatch` error values.
+- `rollup.ErrOutOfOrder`, `rollup.ErrWindowMismatch`, `rollup.ErrNonFinite` error values. `ErrNonFinite` is returned by `Add` and `AddBatch` for a NaN or infinite value, and leaves the roller (and its most-recent marker) unchanged.
 
 ## Tests
 

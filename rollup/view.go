@@ -14,8 +14,8 @@ import (
 // All methods are safe to call concurrently from multiple goroutines.
 type View struct {
 	// window is the coarse window size: the roller's window size times
-	// the factor the view was derived with. windows is fixed at
-	// derivation and read without a lock.
+	// the factor the view was derived with. windows is fixed and fully
+	// finalized at derivation and read without a lock.
 	window  time.Duration
 	windows []Window
 }
@@ -47,15 +47,13 @@ func (r *Roller) Rollup(factor int) *View {
 
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	fine := r.buckets
-	if len(r.back) != 0 {
-		fine = mergeWindows(r.buckets, r.sortedBackLocked())
-	}
+	fine, fineAgg := r.snapshotLocked()
 	// The coarse start is monotone in the fine start, so covered windows
 	// are consecutive and the whole derivation is one linear pass with a
 	// single output allocation bounded by the number of fine windows.
 	windows := make([]Window, 0, len(fine))
-	for _, f := range fine {
+	sums := make([]*agg, 0, len(fine))
+	for k, f := range fine {
 		start := alignStart(f.Start, w)
 		if n := len(windows); n != 0 && windows[n-1].Start.Equal(start) {
 			cur := &windows[n-1]
@@ -67,6 +65,7 @@ func (r *Roller) Rollup(factor int) *View {
 			if f.Max > cur.Max {
 				cur.Max = f.Max
 			}
+			sums[n-1].merge(aggAt(fineAgg, k, f))
 		} else {
 			windows = append(windows, Window{
 				Start: start,
@@ -75,7 +74,14 @@ func (r *Roller) Rollup(factor int) *View {
 				Min:   f.Min,
 				Max:   f.Max,
 			})
+			sums = append(sums, newAgg())
+			sums[len(sums)-1].merge(aggAt(fineAgg, k, f))
 		}
+	}
+	// The view is a snapshot, so finalize once, here: later reads see
+	// plain windows and never touch the roller's accumulators.
+	for i := range windows {
+		windows[i] = finalize(windows[i], sums[i])
 	}
 	return &View{window: coarse, windows: windows}
 }
