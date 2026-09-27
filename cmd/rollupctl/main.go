@@ -144,7 +144,7 @@ func runMerge(pathA, pathB string, d time.Duration, stdout, stderr io.Writer) in
 		return code
 	}
 	if err := rollerA.Merge(rollerB); err != nil {
-		fmt.Fprintf(stderr, "rollupctl: %s %s: %v\n", pathA, pathB, err)
+		fmt.Fprintf(stderr, "rollupctl: %s, %s: %v\n", pathA, pathB, err)
 		return 4
 	}
 	out := bufio.NewWriter(stdout)
