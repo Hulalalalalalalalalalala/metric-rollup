@@ -12,6 +12,7 @@ Go 1.22 or newer. Standard library only.
     go run ./cmd/rollupctl --file <path> --window <duration> windows
     go run ./cmd/rollupctl --file <path> --window <duration> --from <ns> --to <ns> range
     go run ./cmd/rollupctl --file <path> --file <path> --window <duration> merge
+    go run ./cmd/rollupctl --file <path> --window <duration> --from <ns> --to <ns> rates
 
 `rollupctl` reads one sample per line — nanoseconds since the epoch,
 whitespace, then a float — and prints, per window, its epoch-aligned start,
@@ -19,9 +20,14 @@ count, sum, minimum, and maximum. `windows` prints every window; `range`
 prints only the windows overlapping the half-open interval `[--from, --to)`
 (both endpoints in nanoseconds since the epoch), streamed out in cursor
 batches; `merge` aggregates two files with the same window duration and
-prints their windows combined. Exit codes: 2 for bad arguments, 3 if a
-file is missing or a directory, 4 for invalid file contents or a merge
-that cannot be combined.
+prints their windows combined. `rates` treats the values as a cumulative
+counter that may reset and prints, for every epoch-aligned window
+overlapping `[--from, --to)` that holds at least one increment, six
+columns: start, increment count, increment sum, minimum, maximum, and rate
+(the increment sum divided by the window width in seconds). Exit codes: 2
+for bad arguments, 3 if a file is missing or a directory, 4 for invalid
+file contents (including a negative counter value) or a merge that cannot
+be combined.
 
 ## Public interface
 
@@ -40,6 +46,41 @@ that cannot be combined.
 - `(*View).Cursor(from, to time.Time) *Cursor` snapshots a coarse range for batched reads.
 - `type Window struct { Start time.Time; Count int64; Sum, Min, Max float64 }`.
 - `rollup.ErrOutOfOrder`, `rollup.ErrWindowMismatch`, `rollup.ErrNonFinite` error values.
+
+### Cumulative counters
+
+`rollup.NewCounter(window time.Duration) *Counter` builds a counter; it
+panics with `rollup: bad window` if `window <= 0`. A `Counter` consumes
+the same `Sample` records as a `Roller`, but its values must be finite
+and non-negative:
+
+- `(*Counter).Add(at time.Time, value float64) error` files one cumulative
+  reading; `(*Counter).AddBatch(samples []Sample) error` files a batch
+  atomically — all of it or none — processing the readings in slice order
+  against a marker shared with `Add`.
+- The first reading only establishes the baseline. Each later reading
+  produces one increment relative to the previous one: `current-previous`
+  (one float64 subtraction) on a normal rise or a tie, and the reading
+  itself when a smaller reading identifies a counter reset.
+- Readings with the same timestamp are taken in arrival order; an
+  increment belongs to the later reading's epoch-aligned window, so ties
+  and resets at one instant file zero or reset increments there.
+- A rejected reading or batch changes nothing: non-finite values return
+  `ErrNonFinite`, values before the marker return `ErrOutOfOrder`, and
+  negative cumulative values return `ErrNegativeCounter`.
+- `(*Counter).Rates(from, to time.Time) []RateWindow` returns, in time
+  order, the windows overlapping `[from, to)` that actually hold at least
+  one increment — windows with none are skipped. An empty or backwards
+  range succeeds with no output.
+- `(*Counter).RateCursor(from, to time.Time) *RateCursor` snapshots a
+  range for batched reads; `(*RateCursor).Next(n int) []RateWindow`
+  returns the next batch, then an empty slice once the range is exhausted.
+- `type RateWindow struct { Start time.Time; Count int64; Sum, Min, Max, Rate float64 }`.
+  `Count` is the increment count, `Sum` the exact real increment sum
+  rounded to float64 once, `Min`/`Max` the single-increment range, and
+  `Rate` `Sum / window.Seconds()`. Zero increments are positive zeros.
+- A `Counter` is safe for concurrent use like a `Roller`, and every read
+  observes one internally consistent snapshot.
 
 ### Numeric semantics
 

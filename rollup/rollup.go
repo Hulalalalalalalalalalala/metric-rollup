@@ -5,6 +5,10 @@
 // and rollers merged from multiple goroutines at once. Every read observes
 // an internally consistent snapshot, and a merge or batch is visible to
 // other callers either in full or not at all.
+//
+// A Counter offers the same guarantees for a cumulative counter that may
+// reset: it derives increments from successive readings and reports their
+// per-window sums and rates.
 package rollup
 
 import (
