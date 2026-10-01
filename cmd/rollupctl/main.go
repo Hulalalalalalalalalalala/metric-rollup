@@ -7,6 +7,7 @@
 //	rollupctl --file <path> --window <duration> windows
 //	rollupctl --file <path> --window <duration> --from <ns> --to <ns> range
 //	rollupctl --file <path> --file <path> --window <duration> merge
+//	rollupctl --file <path> --window <duration> --from <ns> --to <ns> rates
 //
 // The input file holds one sample per line: an integer number of
 // nanoseconds since the epoch, whitespace, then a floating-point value.
@@ -18,6 +19,14 @@
 // endpoints given as nanoseconds since the epoch. The merge subcommand
 // aggregates two files with the same window duration and prints their
 // windows combined into one listing.
+//
+// The rates subcommand treats the file as a cumulative counter: the first
+// sample sets the baseline, a later value below the preceding one is taken
+// as a reset, and each increment is attributed to the later sample's
+// window. It prints, per window overlapping [--from, --to) that actually
+// holds increments, the window start, increment count, increment sum,
+// minimum increment, maximum increment, and rate (sum over the window's
+// seconds), one line per window.
 //
 // Exit codes: 0 success, 2 bad command-line arguments, 3 an input file
 // does not exist or is a directory, 4 an input file's contents are
@@ -81,7 +90,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	switch cmd.sub {
-	case "range":
+	case "range", "rates":
 		from, err := strconv.ParseInt(cmd.from, 10, 64)
 		if err != nil {
 			argError(stderr, "invalid --from %q: %v", cmd.from, err)
@@ -91,6 +100,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			argError(stderr, "invalid --to %q: %v", cmd.to, err)
 			return 2
+		}
+		if cmd.sub == "rates" {
+			return runRates(cmd.files[len(cmd.files)-1], d, from, to, stdout, stderr)
 		}
 		return runRange(cmd.files[len(cmd.files)-1], d, from, to, stdout, stderr)
 	case "merge":
@@ -131,6 +143,28 @@ func runRange(path string, d time.Duration, from, to int64, stdout, stderr io.Wr
 	return flush(out, stderr)
 }
 
+// runRates ingests one file as a cumulative counter and prints the
+// increment windows overlapping the half-open interval [from, to),
+// advancing through them in cursor batches. The whole file is ingested
+// before anything is printed, so a content problem leaves stdout empty.
+// An empty or backwards interval is not an error and prints nothing.
+func runRates(path string, d time.Duration, from, to int64, stdout, stderr io.Writer) int {
+	counter, code := ingestCounterFile(path, d, stderr)
+	if code != 0 {
+		return code
+	}
+	out := bufio.NewWriter(stdout)
+	cursor := counter.RateCursor(time.Unix(0, from).UTC(), time.Unix(0, to).UTC())
+	for {
+		batch := cursor.Next(rangeBatchSize)
+		if len(batch) == 0 {
+			break
+		}
+		writeRates(out, batch)
+	}
+	return flush(out, stderr)
+}
+
 // runMerge aggregates two files with the same window duration and prints
 // their combined windows. Both files are fully ingested before anything is
 // printed, so a problem in either one leaves the listing empty.
@@ -158,6 +192,17 @@ func writeWindows(out *bufio.Writer, ws []rollup.Window) {
 		fmt.Fprintf(out, "%s %d %s %s %s\n",
 			unixNanoText(w.Start), w.Count,
 			formatFloat(w.Sum), formatFloat(w.Min), formatFloat(w.Max))
+	}
+}
+
+// writeRates prints one line per increment window: start, count, sum, min,
+// max, rate.
+func writeRates(out *bufio.Writer, ws []rollup.RateWindow) {
+	for _, w := range ws {
+		fmt.Fprintf(out, "%s %d %s %s %s %s\n",
+			unixNanoText(w.Start), w.Count,
+			formatFloat(w.Sum), formatFloat(w.Min), formatFloat(w.Max),
+			formatFloat(w.Rate))
 	}
 }
 
@@ -200,7 +245,7 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 			continue
 		}
 		if flagsEnded || !strings.HasPrefix(a, "-") || a == "-" {
-			if sub != "" || (a != "windows" && a != "range" && a != "merge") {
+			if sub != "" || (a != "windows" && a != "range" && a != "merge" && a != "rates") {
 				return fail("unexpected argument %q", a)
 			}
 			sub = a
@@ -245,7 +290,7 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 	}
 	cmd.sub = sub
 	if sub == "" {
-		return fail("expected a subcommand: windows, range, or merge")
+		return fail("expected a subcommand: windows, range, rates, or merge")
 	}
 	if len(cmd.files) == 0 {
 		return fail("--file is required")
@@ -258,9 +303,9 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 		if len(cmd.files) != 2 {
 			return fail("merge takes exactly two --file arguments, got %d", len(cmd.files))
 		}
-	case "range":
+	case "range", "rates":
 		if len(cmd.files) != 1 {
-			return fail("range takes exactly one --file argument, got %d", len(cmd.files))
+			return fail("%s takes exactly one --file argument, got %d", sub, len(cmd.files))
 		}
 		if !cmd.hasFrom {
 			return fail("--from is required")
@@ -279,10 +324,16 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 	return cmd, true
 }
 
-// ingestFile opens one input file and streams its samples into a fresh
-// roller. It returns a non-zero exit code after writing one diagnostic if
-// the file cannot be opened or its contents are invalid.
-func ingestFile(path string, d time.Duration, stderr io.Writer) (*rollup.Roller, int) {
+// sampleAdder is anything a parsed sample line can be filed into: a
+// Roller aggregates the values, a Counter interprets them cumulatively.
+type sampleAdder interface {
+	Add(time.Time, float64) error
+}
+
+// openInput opens one input file after confirming it exists and is not a
+// directory. It returns a non-zero exit code after writing one diagnostic
+// otherwise.
+func openInput(path string, stderr io.Writer) (*os.File, int) {
 	info, err := os.Stat(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "rollupctl: %s\n", err)
@@ -297,21 +348,46 @@ func ingestFile(path string, d time.Duration, stderr io.Writer) (*rollup.Roller,
 		fmt.Fprintf(stderr, "rollupctl: %s\n", err)
 		return nil, 3
 	}
-	roller, code := ingest(f, path, d, stderr)
-	f.Close()
+	return f, 0
+}
+
+// ingestFile opens one input file and streams its samples into a fresh
+// roller. It returns a non-zero exit code after writing one diagnostic if
+// the file cannot be opened or its contents are invalid.
+func ingestFile(path string, d time.Duration, stderr io.Writer) (*rollup.Roller, int) {
+	f, code := openInput(path, stderr)
 	if code != 0 {
+		return nil, code
+	}
+	defer f.Close()
+	roller := rollup.New(d)
+	if code := streamSamples(f, path, roller, stderr); code != 0 {
 		return nil, code
 	}
 	return roller, 0
 }
 
-// ingest streams the samples from in into a fresh roller. On any content
-// problem it returns code 4 after writing one diagnostic naming the file
-// and line; no sample lines are printed by the caller in that case.
-func ingest(in io.Reader, name string, d time.Duration, stderr io.Writer) (*rollup.Roller, int) {
-	contentError := func(line int, reason string) (*rollup.Roller, int) {
+// ingestCounterFile opens one input file and streams its samples into a
+// fresh cumulative counter. Exit codes and diagnostics match ingestFile.
+func ingestCounterFile(path string, d time.Duration, stderr io.Writer) (*rollup.Counter, int) {
+	f, code := openInput(path, stderr)
+	if code != 0 {
+		return nil, code
+	}
+	defer f.Close()
+	counter := rollup.NewCounter(d)
+	if code := streamSamples(f, path, counter, stderr); code != 0 {
+		return nil, code
+	}
+	return counter, 0
+}
+
+// streamSamples parses one file's lines and files each into adder. It
+// returns 4 after one file:line diagnostic on any content problem.
+func streamSamples(in io.Reader, name string, adder sampleAdder, stderr io.Writer) int {
+	contentError := func(line int, reason string) int {
 		fmt.Fprintf(stderr, "rollupctl: %s:%d: %s\n", name, line, reason)
-		return nil, 4
+		return 4
 	}
 
 	// The line buffer is capped at one byte over the limit, so a longer
@@ -319,7 +395,6 @@ func ingest(in io.Reader, name string, d time.Duration, stderr io.Writer) (*roll
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, maxLineBytes+1), maxLineBytes+1)
 
-	roller := rollup.New(d)
 	line := 0
 	samples := 0
 	for sc.Scan() {
@@ -343,7 +418,7 @@ func ingest(in io.Reader, name string, d time.Duration, stderr io.Writer) (*roll
 		if math.IsNaN(value) || math.IsInf(value, 0) {
 			return contentError(line, "value must be finite")
 		}
-		if err := roller.Add(time.Unix(0, ns).UTC(), value); err != nil {
+		if err := adder.Add(time.Unix(0, ns).UTC(), value); err != nil {
 			return contentError(line, err.Error())
 		}
 		samples++
@@ -355,12 +430,12 @@ func ingest(in io.Reader, name string, d time.Duration, stderr io.Writer) (*roll
 			return contentError(line+1, "line is longer than 1024 bytes")
 		}
 		fmt.Fprintf(stderr, "rollupctl: %s: %v\n", name, err)
-		return nil, 3
+		return 3
 	}
 	if samples == 0 {
 		return contentError(0, "no samples found")
 	}
-	return roller, 0
+	return 0
 }
 
 // formatFloat writes a float64 in its shortest round-trippable form; a
