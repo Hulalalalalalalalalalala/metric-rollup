@@ -8,12 +8,15 @@
 //	rollupctl --file <path> --window <duration> --from <ns> --to <ns> range
 //	rollupctl --file <path> --file <path> --window <duration> merge
 //	rollupctl --file <path> --window <duration> --from <ns> --to <ns> rates
+//	rollupctl --file <path> --window <duration> --max-series <n> --overflow aggregate|reject series
 //
 // The input file holds one sample per line: an integer number of
 // nanoseconds since the epoch, whitespace, then a floating-point value.
 // Blank and whitespace-only lines carry no sample. Samples must arrive in
 // non-decreasing time order. The values given to rates are cumulative
-// counter readings and must be finite and non-negative.
+// counter readings and must be finite and non-negative. The series
+// subcommand adds a third field, a JSON object whose string pairs label
+// the series: "ns value {\"k\":\"v\"}".
 //
 // The windows subcommand prints every window. The range subcommand prints
 // only the windows overlapping the half-open interval [--from, --to), both
@@ -24,15 +27,19 @@
 // epoch-aligned window overlapping [--from, --to) that holds at least one
 // increment, its start, increment count, increment sum, minimum, maximum,
 // and rate (the increment sum divided by the window width in seconds).
+// The series subcommand files labeled samples into per-series windows,
+// bounds the number of distinct series, and prints one
+// metric-rollup/series-report/v1 JSON document.
 //
 // Exit codes: 0 success, 2 bad command-line arguments, 3 an input file
 // does not exist or is a directory, 4 an input file's contents are
-// invalid, including a negative counter value, or the two files cannot be
-// merged.
+// invalid, including a negative counter value, a sample rejected under a
+// reject overflow policy, or the two files cannot be merged.
 package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -67,6 +74,10 @@ type command struct {
 	window         string
 	from, to       string
 	hasFrom, hasTo bool
+	maxSeries      string
+	hasMaxSeries   bool
+	overflow       string
+	hasOverflow    bool
 }
 
 // run parses args, reads the input file or files, and writes the window
@@ -114,6 +125,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runRates(cmd.files[len(cmd.files)-1], d, from, to, stdout, stderr)
 	case "merge":
 		return runMerge(cmd.files[0], cmd.files[1], d, stdout, stderr)
+	case "series":
+		maxSeries, err := strconv.Atoi(cmd.maxSeries)
+		if err != nil {
+			argError(stderr, "invalid --max-series %q: %v", cmd.maxSeries, err)
+			return 2
+		}
+		if maxSeries <= 0 {
+			argError(stderr, "--max-series must be positive, got %d", maxSeries)
+			return 2
+		}
+		switch cmd.overflow {
+		case "aggregate":
+			return runSeries(cmd.files[len(cmd.files)-1], d, maxSeries, rollup.OverflowAggregate, stdout, stderr)
+		case "reject":
+			return runSeries(cmd.files[len(cmd.files)-1], d, maxSeries, rollup.OverflowReject, stdout, stderr)
+		default:
+			argError(stderr, "invalid --overflow %q: want aggregate or reject", cmd.overflow)
+			return 2
+		}
 	default:
 		return runWindows(cmd.files[len(cmd.files)-1], d, stdout, stderr)
 	}
@@ -203,6 +233,108 @@ func runMerge(pathA, pathB string, d time.Duration, stdout, stderr io.Writer) in
 	return flush(out, stderr)
 }
 
+// seriesReport is the on-disk metric-rollup/series-report/v1 document.
+type seriesReport struct {
+	Schema      string            `json:"schema"`
+	WindowNS    int64             `json:"window_ns"`
+	Series      []seriesEntry     `json:"series"`
+	Cardinality cardinalityOutput `json:"cardinality"`
+}
+
+// seriesEntry is one reported series: its labels, whether it is the
+// overflow bucket, and its windows.
+type seriesEntry struct {
+	Labels   map[string]string `json:"labels"`
+	Overflow bool              `json:"overflow"`
+	Windows  []seriesWindowOut `json:"windows"`
+}
+
+// seriesWindowOut is one window of one series: start in nanoseconds since
+// the epoch, count, sum, minimum, and maximum.
+type seriesWindowOut struct {
+	StartNS json.Number `json:"start_ns"`
+	Count   int64       `json:"count"`
+	Sum     jsonFloat   `json:"sum"`
+	Min     jsonFloat   `json:"min"`
+	Max     jsonFloat   `json:"max"`
+}
+
+// cardinalityOutput is the report's cardinality object.
+type cardinalityOutput struct {
+	AcceptedSeries  int   `json:"accepted_series"`
+	OverflowSeries  int   `json:"overflow_series"`
+	RejectedSamples int64 `json:"rejected_samples"`
+}
+
+// jsonFloat is a float64 that marshals in its shortest round-trippable
+// form; a non-finite sum a finite sample set rounded to emits null, the
+// only JSON token that can stand for it.
+type jsonFloat float64
+
+// MarshalJSON implements json.Marshaler.
+func (f jsonFloat) MarshalJSON() ([]byte, error) {
+	v := float64(f)
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return []byte("null"), nil
+	}
+	return []byte(strconv.FormatFloat(v, 'g', -1, 64)), nil
+}
+
+// runSeries ingests one labeled-sample file and prints one
+// metric-rollup/series-report/v1 document. The whole file is ingested
+// before anything is printed, so a bad field or a rejected sample leaves
+// stdout empty.
+func runSeries(path string, d time.Duration, maxSeries int, policy rollup.OverflowPolicy, stdout, stderr io.Writer) int {
+	f, code := openInput(path, stderr)
+	if code != 0 {
+		return code
+	}
+	defer f.Close()
+	set := rollup.NewSeriesSet(d, maxSeries, policy)
+	if code := ingestSeriesInto(f, path, set, stderr); code != 0 {
+		return code
+	}
+	series, card := set.Snapshot()
+	doc := seriesReport{
+		Schema:   "metric-rollup/series-report/v1",
+		WindowNS: d.Nanoseconds(),
+		Series:   make([]seriesEntry, 0, len(series)),
+		Cardinality: cardinalityOutput{
+			AcceptedSeries:  card.AcceptedSeries,
+			OverflowSeries:  card.OverflowSeries,
+			RejectedSamples: card.RejectedSamples,
+		},
+	}
+	for _, sw := range series {
+		entry := seriesEntry{
+			Labels:   sw.Labels,
+			Overflow: sw.Overflow,
+			Windows:  make([]seriesWindowOut, 0, len(sw.Windows)),
+		}
+		for _, w := range sw.Windows {
+			entry.Windows = append(entry.Windows, seriesWindowOut{
+				StartNS: json.Number(unixNanoText(w.Start)),
+				Count:   w.Count,
+				Sum:     jsonFloat(w.Sum),
+				Min:     jsonFloat(w.Min),
+				Max:     jsonFloat(w.Max),
+			})
+		}
+		doc.Series = append(doc.Series, entry)
+	}
+	// Marshal before writing so an encoding failure never leaves a
+	// partial document on stdout.
+	data, err := json.Marshal(doc)
+	if err != nil {
+		fmt.Fprintf(stderr, "rollupctl: %s\n", err)
+		return 1
+	}
+	out := bufio.NewWriter(stdout)
+	out.Write(data)
+	out.WriteByte('\n')
+	return flush(out, stderr)
+}
+
 // writeWindows prints one line per window: start, count, sum, min, max.
 func writeWindows(out *bufio.Writer, ws []rollup.Window) {
 	for _, w := range ws {
@@ -251,7 +383,7 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 			continue
 		}
 		if flagsEnded || !strings.HasPrefix(a, "-") || a == "-" {
-			if sub != "" || (a != "windows" && a != "range" && a != "rates" && a != "merge") {
+			if sub != "" || (a != "windows" && a != "range" && a != "rates" && a != "merge" && a != "series") {
 				return fail("unexpected argument %q", a)
 			}
 			sub = a
@@ -269,7 +401,7 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 			inline = true
 		}
 		switch name {
-		case "file", "window", "from", "to":
+		case "file", "window", "from", "to", "max-series", "overflow":
 			if !inline {
 				i++
 				if i >= len(args) {
@@ -289,6 +421,10 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 				cmd.from, cmd.hasFrom = value, true
 			case "to":
 				cmd.to, cmd.hasTo = value, true
+			case "max-series":
+				cmd.maxSeries, cmd.hasMaxSeries = value, true
+			case "overflow":
+				cmd.overflow, cmd.hasOverflow = value, true
 			}
 		default:
 			return fail("unexpected argument %q", a)
@@ -296,7 +432,7 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 	}
 	cmd.sub = sub
 	if sub == "" {
-		return fail("expected a subcommand: windows, range, rates, or merge")
+		return fail("expected a subcommand: windows, range, rates, merge, or series")
 	}
 	if len(cmd.files) == 0 {
 		return fail("--file is required")
@@ -306,10 +442,16 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 		if cmd.hasFrom || cmd.hasTo {
 			return fail("--from and --to belong to the range subcommand")
 		}
+		if cmd.hasMaxSeries || cmd.hasOverflow {
+			return fail("--max-series and --overflow belong to the series subcommand")
+		}
 		if len(cmd.files) != 2 {
 			return fail("merge takes exactly two --file arguments, got %d", len(cmd.files))
 		}
 	case "range", "rates":
+		if cmd.hasMaxSeries || cmd.hasOverflow {
+			return fail("--max-series and --overflow belong to the series subcommand")
+		}
 		if len(cmd.files) != 1 {
 			return fail("%s takes exactly one --file argument, got %d", sub, len(cmd.files))
 		}
@@ -319,9 +461,25 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 		if !cmd.hasTo {
 			return fail("--to is required")
 		}
+	case "series":
+		if cmd.hasFrom || cmd.hasTo {
+			return fail("--from and --to belong to the range subcommand")
+		}
+		if len(cmd.files) != 1 {
+			return fail("series takes exactly one --file argument, got %d", len(cmd.files))
+		}
+		if !cmd.hasMaxSeries {
+			return fail("--max-series is required")
+		}
+		if !cmd.hasOverflow {
+			return fail("--overflow is required")
+		}
 	default: // windows
 		if cmd.hasFrom || cmd.hasTo {
 			return fail("--from and --to belong to the range subcommand")
+		}
+		if cmd.hasMaxSeries || cmd.hasOverflow {
+			return fail("--max-series and --overflow belong to the series subcommand")
 		}
 	}
 	if cmd.window == "" {
@@ -443,6 +601,138 @@ func ingestInto(in io.Reader, name string, dst ingester, stderr io.Writer) int {
 		return contentError(0, "no samples found")
 	}
 	return 0
+}
+
+// seriesIngester is the ingestion surface of a SeriesSet.
+type seriesIngester interface {
+	Add(sample rollup.LabeledSample) error
+}
+
+// ingestSeriesInto streams labeled records from in into dst. Each line is
+// a nanosecond timestamp, a finite float value, and a JSON object of
+// string pairs, separated by whitespace; the JSON object may itself
+// contain whitespace, so only the first two fields are split by
+// whitespace and the remainder is parsed as JSON. On any content problem
+// it returns code 4 after writing one diagnostic naming the file and
+// line; no output is printed by the caller in that case.
+func ingestSeriesInto(in io.Reader, name string, dst seriesIngester, stderr io.Writer) int {
+	contentError := func(line int, reason string) int {
+		fmt.Fprintf(stderr, "rollupctl: %s:%d: %s\n", name, line, reason)
+		return 4
+	}
+
+	// The line buffer is capped at one byte over the limit, so a longer
+	// line fails immediately instead of growing with the file.
+	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, maxLineBytes+1), maxLineBytes+1)
+
+	line := 0
+	samples := 0
+	for sc.Scan() {
+		line++
+		text := sc.Text()
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		rest := strings.TrimLeft(text, " \t")
+		i := strings.IndexAny(rest, " \t")
+		if i < 0 {
+			return contentError(line, "expected a nanosecond timestamp, a value, and a JSON label object separated by whitespace")
+		}
+		nsText := rest[:i]
+		rest = strings.TrimLeft(rest[i:], " \t")
+		j := strings.IndexAny(rest, " \t")
+		if j < 0 {
+			return contentError(line, "expected a value and a JSON label object after the timestamp")
+		}
+		valueText := rest[:j]
+		labelsText := strings.TrimSpace(rest[j:])
+
+		ns, err := strconv.ParseInt(nsText, 10, 64)
+		if err != nil {
+			return contentError(line, fmt.Sprintf("invalid timestamp %q", nsText))
+		}
+		value, err := strconv.ParseFloat(valueText, 64)
+		if err != nil {
+			return contentError(line, fmt.Sprintf("invalid value %q", valueText))
+		}
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return contentError(line, "value must be finite")
+		}
+		labels, err := parseLabelObject(labelsText)
+		if err != nil {
+			return contentError(line, fmt.Sprintf("invalid labels: %v", err))
+		}
+		if err := dst.Add(rollup.LabeledSample{
+			At:     time.Unix(0, ns).UTC(),
+			Value:  value,
+			Labels: labels,
+		}); err != nil {
+			return contentError(line, err.Error())
+		}
+		samples++
+	}
+	if err := sc.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			return contentError(line+1, "line is longer than 1024 bytes")
+		}
+		fmt.Fprintf(stderr, "rollupctl: %s: %v\n", name, err)
+		return 3
+	}
+	if samples == 0 {
+		return contentError(0, "no samples found")
+	}
+	return 0
+}
+
+// parseLabelObject parses one JSON object whose keys and values are both
+// strings. It rejects anything that is not exactly one such object:
+// arrays, scalars, null, trailing data, duplicate keys, and non-string
+// values. The empty object is legal and yields an empty non-nil map.
+func parseLabelObject(text string) (map[string]string, error) {
+	dec := json.NewDecoder(strings.NewReader(text))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return nil, errors.New("labels must be a JSON object")
+	}
+	labels := make(map[string]string)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, errors.New("label keys must be strings")
+		}
+		var raw any
+		if err := dec.Decode(&raw); err != nil {
+			return nil, err
+		}
+		value, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("label %q must have a string value", key)
+		}
+		if _, dup := labels[key]; dup {
+			return nil, fmt.Errorf("duplicate label key %q", key)
+		}
+		labels[key] = value
+	}
+	if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim('}') {
+		return nil, errors.New("malformed label object")
+	}
+	if tok, err := dec.Token(); err != io.EOF {
+		if err != nil {
+			return nil, err
+		}
+		_ = tok
+		return nil, errors.New("trailing data after label object")
+	}
+	return labels, nil
 }
 
 // formatFloat writes a float64 in its shortest round-trippable form; a
