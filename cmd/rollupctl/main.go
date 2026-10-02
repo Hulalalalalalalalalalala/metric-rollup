@@ -8,12 +8,15 @@
 //	rollupctl --file <path> --window <duration> --from <ns> --to <ns> range
 //	rollupctl --file <path> --file <path> --window <duration> merge
 //	rollupctl --file <path> --window <duration> --from <ns> --to <ns> rates
+//	rollupctl --file <path> --window <duration> --max-series <n> --overflow aggregate|reject series
 //
 // The input file holds one sample per line: an integer number of
 // nanoseconds since the epoch, whitespace, then a floating-point value.
-// Blank and whitespace-only lines carry no sample. Samples must arrive in
-// non-decreasing time order. The values given to rates are cumulative
-// counter readings and must be finite and non-negative.
+// For series each line carries one more whitespace-separated field: a JSON
+// object of string labels, such as {"host":"a"} ({} for the empty label
+// set). Blank and whitespace-only lines carry no sample. Samples must
+// arrive in non-decreasing time order. The values given to rates are
+// cumulative counter readings and must be finite and non-negative.
 //
 // The windows subcommand prints every window. The range subcommand prints
 // only the windows overlapping the half-open interval [--from, --to), both
@@ -23,12 +26,15 @@
 // values as a cumulative counter that may reset and prints, for every
 // epoch-aligned window overlapping [--from, --to) that holds at least one
 // increment, its start, increment count, increment sum, minimum, maximum,
-// and rate (the increment sum divided by the window width in seconds).
+// and rate (the increment sum divided by the window width in seconds). The
+// series subcommand files labeled samples with a bounded number of named
+// series and prints one metric-rollup/series-report/v1 JSON document.
 //
 // Exit codes: 0 success, 2 bad command-line arguments, 3 an input file
 // does not exist or is a directory, 4 an input file's contents are
-// invalid, including a negative counter value, or the two files cannot be
-// merged.
+// invalid, including a negative counter value, the two files cannot be
+// merged, a series line carries a bad field, or a labeled sample is
+// refused under --overflow reject.
 package main
 
 import (
@@ -67,6 +73,10 @@ type command struct {
 	window         string
 	from, to       string
 	hasFrom, hasTo bool
+	maxSeries      string
+	hasMaxSeries   bool
+	overflow       string
+	hasOverflow    bool
 }
 
 // run parses args, reads the input file or files, and writes the window
@@ -114,6 +124,27 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runRates(cmd.files[len(cmd.files)-1], d, from, to, stdout, stderr)
 	case "merge":
 		return runMerge(cmd.files[0], cmd.files[1], d, stdout, stderr)
+	case "series":
+		maxSeries, err := strconv.ParseInt(cmd.maxSeries, 10, 64)
+		if err != nil {
+			argError(stderr, "invalid --max-series %q: %v", cmd.maxSeries, err)
+			return 2
+		}
+		if maxSeries <= 0 {
+			argError(stderr, "--max-series must be positive, got %d", maxSeries)
+			return 2
+		}
+		var policy rollup.OverflowPolicy
+		switch cmd.overflow {
+		case "aggregate":
+			policy = rollup.OverflowAggregate
+		case "reject":
+			policy = rollup.OverflowReject
+		default:
+			argError(stderr, "invalid --overflow %q: want aggregate or reject", cmd.overflow)
+			return 2
+		}
+		return runSeries(cmd.files[len(cmd.files)-1], d, int(maxSeries), policy, stdout, stderr)
 	default:
 		return runWindows(cmd.files[len(cmd.files)-1], d, stdout, stderr)
 	}
@@ -251,7 +282,7 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 			continue
 		}
 		if flagsEnded || !strings.HasPrefix(a, "-") || a == "-" {
-			if sub != "" || (a != "windows" && a != "range" && a != "rates" && a != "merge") {
+			if sub != "" || (a != "windows" && a != "range" && a != "rates" && a != "merge" && a != "series") {
 				return fail("unexpected argument %q", a)
 			}
 			sub = a
@@ -269,7 +300,7 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 			inline = true
 		}
 		switch name {
-		case "file", "window", "from", "to":
+		case "file", "window", "from", "to", "max-series", "overflow":
 			if !inline {
 				i++
 				if i >= len(args) {
@@ -289,6 +320,10 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 				cmd.from, cmd.hasFrom = value, true
 			case "to":
 				cmd.to, cmd.hasTo = value, true
+			case "max-series":
+				cmd.maxSeries, cmd.hasMaxSeries = value, true
+			case "overflow":
+				cmd.overflow, cmd.hasOverflow = value, true
 			}
 		default:
 			return fail("unexpected argument %q", a)
@@ -296,7 +331,7 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 	}
 	cmd.sub = sub
 	if sub == "" {
-		return fail("expected a subcommand: windows, range, rates, or merge")
+		return fail("expected a subcommand: windows, range, rates, merge, or series")
 	}
 	if len(cmd.files) == 0 {
 		return fail("--file is required")
@@ -306,6 +341,9 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 		if cmd.hasFrom || cmd.hasTo {
 			return fail("--from and --to belong to the range subcommand")
 		}
+		if cmd.hasMaxSeries || cmd.hasOverflow {
+			return fail("--max-series and --overflow belong to the series subcommand")
+		}
 		if len(cmd.files) != 2 {
 			return fail("merge takes exactly two --file arguments, got %d", len(cmd.files))
 		}
@@ -313,15 +351,34 @@ func parseArgs(args []string, stderr io.Writer) (command, bool) {
 		if len(cmd.files) != 1 {
 			return fail("%s takes exactly one --file argument, got %d", sub, len(cmd.files))
 		}
+		if cmd.hasMaxSeries || cmd.hasOverflow {
+			return fail("--max-series and --overflow belong to the series subcommand")
+		}
 		if !cmd.hasFrom {
 			return fail("--from is required")
 		}
 		if !cmd.hasTo {
 			return fail("--to is required")
 		}
+	case "series":
+		if cmd.hasFrom || cmd.hasTo {
+			return fail("--from and --to belong to the range subcommand")
+		}
+		if len(cmd.files) != 1 {
+			return fail("series takes exactly one --file argument, got %d", len(cmd.files))
+		}
+		if !cmd.hasMaxSeries {
+			return fail("--max-series is required")
+		}
+		if !cmd.hasOverflow {
+			return fail("--overflow is required")
+		}
 	default: // windows
 		if cmd.hasFrom || cmd.hasTo {
 			return fail("--from and --to belong to the range subcommand")
+		}
+		if cmd.hasMaxSeries || cmd.hasOverflow {
+			return fail("--max-series and --overflow belong to the series subcommand")
 		}
 	}
 	if cmd.window == "" {

@@ -13,6 +13,7 @@ Go 1.22 or newer. Standard library only.
     go run ./cmd/rollupctl --file <path> --window <duration> --from <ns> --to <ns> range
     go run ./cmd/rollupctl --file <path> --file <path> --window <duration> merge
     go run ./cmd/rollupctl --file <path> --window <duration> --from <ns> --to <ns> rates
+    go run ./cmd/rollupctl --file <path> --window <duration> --max-series <n> --overflow aggregate|reject series
 
 `rollupctl` reads one sample per line — nanoseconds since the epoch,
 whitespace, then a float — and prints, per window, its epoch-aligned start,
@@ -24,10 +25,17 @@ prints their windows combined. `rates` treats the values as a cumulative
 counter that may reset and prints, for every epoch-aligned window
 overlapping `[--from, --to)` that holds at least one increment, six
 columns: start, increment count, increment sum, minimum, maximum, and rate
-(the increment sum divided by the window width in seconds). Exit codes: 2
-for bad arguments, 3 if a file is missing or a directory, 4 for invalid
-file contents (including a negative counter value) or a merge that cannot
-be combined.
+(the increment sum divided by the window width in seconds). `series` reads
+one labeled sample per line — nanosecond timestamp, a float, and a JSON
+object of string labels, such as `0 1 {"host":"a"}` (`{}` for the empty
+label set) — bounds the number of named series with `--max-series`, files
+new series beyond the quota into one shared overflow bucket
+(`--overflow aggregate`) or refuses them (`--overflow reject`), and prints
+one `metric-rollup/series-report/v1` JSON document. Exit codes: 2 for bad
+arguments, 3 if a file is missing or a directory, 4 for invalid file
+contents (including a negative counter value), a merge that cannot be
+combined, an invalid labeled field, or a labeled sample refused under
+`reject`.
 
 ## Public interface
 
@@ -80,6 +88,42 @@ and non-negative:
   rounded to float64 once, `Min`/`Max` the single-increment range, and
   `Rate` `Sum / window.Seconds()`. Zero increments are positive zeros.
 - A `Counter` is safe for concurrent use like a `Roller`, and every read
+  observes one internally consistent snapshot.
+
+### Labeled series with cardinality control
+
+`rollup.NewSeriesSet(window time.Duration, cfg SeriesConfig) *SeriesSet`
+builds a set of labeled series. `SeriesConfig{MaxSeries int, Overflow
+OverflowPolicy}` requires a positive `MaxSeries` and either
+`OverflowAggregate` or `OverflowReject`; an invalid window panics with
+`rollup: bad window` and any other invalid config with
+`rollup: bad series config`.
+
+- A sample is `LabeledSample{At time.Time; Value float64; Labels
+  map[string]string}`. Samples with equal label keys and values are one
+  series regardless of map iteration order; the empty label map names one
+  ordinary series, distinct from every labeled series and from the
+  overflow bucket.
+- Real series claim one of the `MaxSeries` slots in first-seen order. Once
+  the slots are full, `OverflowAggregate` files a new series' samples into
+  one shared overflow bucket that occupies no slot, and `OverflowReject`
+  refuses each such sample with `ErrSeriesLimit` and counts it.
+- `Add` validates before touching state: an empty label key or value is
+  `ErrInvalidLabel`, a NaN or infinity `ErrNonFinite`, and a sample earlier
+  than that series' own most recent sample `ErrOutOfOrder`. Ordering is per
+  series; different series never constrain each other.
+- `AddBatch(samples []LabeledSample) error` files the batch all or nothing;
+  any validation, limit, or out-of-order failure rejects the whole unit and
+  leaves no slot claimed, no series spilled, and no rejection counted.
+- `Snapshot() []SeriesWindow` returns one consistent snapshot: slot series
+  in first-seen order, the merged overflow bucket last, and windows in time
+  order within each. `SeriesWindow{Labels map[string]string; Overflow bool;
+  Window Window}` — `Labels` is `{}` for both the empty-label series and the
+  bucket, which `Overflow` tells apart.
+- `Cardinality() CardinalityReport` returns `AcceptedSeries` (slots used),
+  `OverflowSeries` (distinct spilled series, each counted once at its first
+  spill), and `RejectedSamples` (samples refused under reject).
+- A `SeriesSet` is safe for concurrent use like a `Roller`, and every read
   observes one internally consistent snapshot.
 
 ### Numeric semantics
